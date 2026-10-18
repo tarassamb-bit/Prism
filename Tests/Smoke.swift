@@ -1,0 +1,289 @@
+import Foundation
+import AVFoundation
+import AppKit
+
+@main struct Smoke {
+    /// The editor plays edits live: ready at once, with the Fit background drawn per frame like export.
+    @MainActor static func checkLivePreview(source: URL, mediaID: UUID) async throws {
+        let started = Date()
+        let item = try await ShortMaker.previewItem(source: source, segment: EditSegment(mediaID: mediaID, duration: 3, fitToFrame: true))
+        let elapsed = Date().timeIntervalSince(started)
+        precondition(elapsed < 1, "Live preview must be ready in under a second, took \(elapsed)s")
+        let generator = AVAssetImageGenerator(asset: item.asset)
+        generator.videoComposition = item.videoComposition
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        let frame = try generator.copyCGImage(at: CMTime(seconds: 1.5, preferredTimescale: 600), actualTime: nil)
+        precondition(frame.width == 1080 && frame.height == 1920, "Live preview must be 1080×1920")
+        let bitmap = NSBitmapImageRep(cgImage: frame)
+        func pixel(_ x: Int, _ y: Int) -> NSColor { bitmap.colorAt(x: x, y: y)!.usingColorSpace(.deviceRGB)! }
+        precondition(pixel(540, 100).greenComponent > 0.12 && pixel(540, 1820).greenComponent > 0.12,
+                     "Live Fit preview must fill both portrait bars with the blurred source")
+        precondition(pixel(900, 960).greenComponent > pixel(900, 960).redComponent * 1.3 && pixel(900, 960).greenComponent > 0.35,
+                     "Live Fit preview must keep the sharp source in the center")
+        try bitmap.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: "test-output/live-fit-preview-frame.png"))
+        precondition(ShortMaker.captionLayer(for: EditSegment(mediaID: mediaID, duration: 3)) == nil &&
+                     ShortMaker.captionLayer(for: EditSegment(mediaID: mediaID, duration: 3, caption: "Hi"))?.sublayers?.count == 1,
+                     "Preview captions must come from the same layers as export")
+        print(String(format: "PASS live preview ready in %.2fs and draws the Fit background like export", elapsed))
+    }
+
+    static func main() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("RelioTest-\(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("pictures.mov")
+        try await makePictureVideo(at: source)
+        guard let imported = await MediaEngine.inspect(source, thumbnailDirectory: root.appendingPathComponent("Thumbnails")) else { fatalError("Import failed") }
+        precondition(imported.kind == "video" && imported.width == 640 && imported.height == 360)
+        precondition(imported.duration > 3.5 && imported.thumbnail != nil)
+        print("PASS import and thumbnail: \(imported.duration)s")
+        let store = try ProjectStore(root: root.appendingPathComponent("Picture project.relio"))
+        let segment = EditSegment(mediaID: imported.id, start: 0, duration: 3, caption: "Three picture test")
+        try store.save(ProjectData(name: "Picture project", media: [imported], segments: [segment]), key: "project")
+        guard let reopened = try store.load(ProjectData.self, key: "project"), reopened.media.count == 1, reopened.segments.first?.caption == "Three picture test" else { fatalError("Persistence failed") }
+        print("PASS project persistence")
+        let invalidSource = root.appendingPathComponent("invalid.mp4")
+        try Data("not a video".utf8).write(to: invalidSource)
+        let invalidImport = await MediaEngine.inspect(invalidSource, thumbnailDirectory: root)
+        precondition(invalidImport == nil)
+        let safeSpeech = ShortMaker.speechSafeRange(start: 0.3, duration: 1, words: [.init(text: "Hello", start: 0.2, duration: 0.3)], interval: (0, 4))
+        precondition(safeSpeech.start < 0.2 && abs(safeSpeech.start + safeSpeech.duration - 1.3) < 0.001,
+                     "Protecting the opening word must not move the intended ending earlier")
+        let firstHalf = try ShortMaker.SourceRegion.firstHalf.interval(videoDuration: 600)
+        let lastHalf = try ShortMaker.SourceRegion.lastHalf.interval(videoDuration: 600)
+        precondition(firstHalf.start == 0 && firstHalf.end == 300)
+        precondition(lastHalf.start == 300 && lastHalf.end == 600)
+        let oddHalf = try ShortMaker.SourceRegion.lastHalf.interval(videoDuration: 601)
+        precondition(oddHalf.start == 300.5 && oddHalf.end == 601)
+        let custom = try ShortMaker.SourceRegion.custom.interval(videoDuration: 600, customStart: 60, customEnd: 600)
+        precondition(custom.start == 60 && custom.end == 600)
+        for range in [(0.0, 60_000.0), (-1, 30), (30, 20), (30, 30), (0, Double.infinity), (Double.nan, 30)] {
+            do {
+                _ = try ShortMaker.SourceRegion.custom.interval(videoDuration: 600, customStart: range.0, customEnd: range.1)
+                fatalError("Invalid custom source range accepted")
+            } catch ShortMaker.Failure.invalidRange { }
+        }
+        do {
+            _ = try await ShortMaker.analyze(source, requestedDuration: 1, count: 1, sourceRegion: .custom, customStart: 0, customEnd: 60_000)
+            fatalError("Analysis must reject a custom end past the actual media duration")
+        } catch ShortMaker.Failure.invalidRange { }
+        do {
+            _ = try await ShortMaker.analyze(source, requestedDuration: 1, count: 1, sourceRegion: .entireVideo,
+                excluding: [.init(start: 0, end: imported.duration)])
+            fatalError("An entirely used source region must not generate fallback duplicates")
+        } catch GeminiSelection.Failure.noDistinctClips { }
+        let halfSelections = try await ShortMaker.analyze(source, requestedDuration: 1, count: 1, sourceRegion: .lastHalf, transcriptionEnabled: false)
+        precondition(halfSelections.allSatisfy { $0.start >= imported.duration / 2 && $0.start + $0.duration <= imported.duration })
+        print("PASS first/last half, fractional midpoint, custom range validation and actual source duration enforcement")
+        let selections = try await ShortMaker.analyze(source, requestedDuration: 1, count: 3, sourceRegion: .entireVideo)
+        precondition(selections.count == 3)
+        precondition(selections.allSatisfy { $0.start >= 0 && $0.start + $0.duration <= imported.duration })
+        let rejected = root.appendingPathComponent("rejected.mp4")
+        for bad in [EditSegment(mediaID: imported.id, start: -1, duration: 2),
+                    EditSegment(mediaID: imported.id, duration: .nan),
+                    EditSegment(mediaID: imported.id, start: 3, duration: 3)] {
+            do {
+                try await ShortMaker.export(source: source, segment: bad, destination: rejected)
+                fatalError("Invalid range accepted")
+            } catch ShortMaker.Failure.invalidRange { }
+            precondition(!FileManager.default.fileExists(atPath: rejected.path))
+        }
+        try Data("preserve me".utf8).write(to: rejected)
+        do {
+            try await ShortMaker.export(source: source, segment: segment, destination: rejected)
+            fatalError("Existing destination overwritten")
+        } catch ShortMaker.Failure.destinationExists { }
+        let preserved = try Data(contentsOf: rejected)
+        precondition(preserved == Data("preserve me".utf8))
+        print("PASS invalid import, selection bounds, invalid edits, and destination preservation")
+        let output = root.appendingPathComponent("short.mp4")
+        try await ShortMaker.export(source: source, segment: segment, destination: output)
+        let plainURL = root.appendingPathComponent("plain.mp4")
+        let timedURL = root.appendingPathComponent("timed.mp4")
+        try await ShortMaker.export(source: source, segment: EditSegment(mediaID: imported.id, duration: 3), destination: plainURL)
+        try await ShortMaker.export(source: source, segment: EditSegment(mediaID: imported.id, duration: 3, caption: "Timed caption", captionStart: 1, captionDuration: 1), destination: timedURL)
+        let fitURL = root.appendingPathComponent("fit.mp4")
+        try await ShortMaker.export(source: source, segment: EditSegment(mediaID: imported.id, duration: 3, fitToFrame: true), destination: fitURL)
+        let fitGenerator = AVAssetImageGenerator(asset: AVURLAsset(url: fitURL))
+        fitGenerator.requestedTimeToleranceBefore = .zero
+        fitGenerator.requestedTimeToleranceAfter = .zero
+        let fitFrame = try fitGenerator.copyCGImage(at: CMTime(seconds: 1.5, preferredTimescale: 600), actualTime: nil)
+        let fitBitmap = NSBitmapImageRep(cgImage: fitFrame)
+        func fitPixel(_ x: Int, _ y: Int) -> NSColor { fitBitmap.colorAt(x: x, y: y)!.usingColorSpace(.deviceRGB)! }
+        let upperBackground = fitPixel(540, 100)
+        let lowerBackground = fitPixel(540, 1820)
+        let foreground = fitPixel(900, 960)
+        precondition(upperBackground.greenComponent > 0.12 && lowerBackground.greenComponent > 0.12,
+                     "Fit mode must fill both portrait bars with the blurred source")
+        precondition(foreground.greenComponent > foreground.redComponent * 1.3 && foreground.greenComponent > 0.35,
+                     "Fit mode must retain the sharp source in the center")
+        let fitPreview = NSBitmapImageRep(cgImage: fitFrame).representation(using: .png, properties: [:])!
+        try FileManager.default.createDirectory(atPath: "test-output", withIntermediateDirectories: true)
+        try fitPreview.write(to: URL(fileURLWithPath: "test-output/fit-blur-frame.png"))
+        print("PASS fit framing fills the top and bottom with a blurred source and keeps the centered video sharp")
+        try await checkLivePreview(source: source, mediaID: imported.id)
+        func pixels(_ url: URL, _ seconds: Double) throws -> [UInt8] {
+            let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+            generator.requestedTimeToleranceBefore = .zero
+            generator.requestedTimeToleranceAfter = .zero
+            let frame = try generator.copyCGImage(at: CMTime(seconds: seconds, preferredTimescale: 600), actualTime: nil)
+            var bytes = [UInt8](repeating: 0, count: 4)
+            bytes.withUnsafeMutableBytes { buffer in
+                let context = CGContext(data: buffer.baseAddress, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+                context.draw(frame.cropping(to: CGRect(x: 90, y: 1550, width: 20, height: 20))!, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+            }
+            return bytes
+        }
+        for time in [0.5, 1.5, 2.5] {
+            let plain = try pixels(plainURL, time)
+            let timed = try pixels(timedURL, time)
+            let difference = zip(plain, timed).map { abs(Int($0) - Int($1)) }.reduce(0, +)
+            precondition(time == 1.5 ? difference > 10 : difference < 60, "Caption visibility incorrect at \(time): \(difference)")
+        }
+        print("PASS caption visible only during its requested interval")
+        let viralURL = root.appendingPathComponent("viral-caption.mp4")
+        let viralCue = TimedCaption(text: "This is the viral caption", start: 0.5, duration: 1.5)
+        let viralWords = [("This", 0.5, 0.2), ("is", 0.7, 0.2), ("the", 0.9, 0.2), ("viral", 1.1, 0.4), ("caption", 1.5, 0.5)]
+            .map { TimedSpeechWord(text: $0.0, start: $0.1, duration: $0.2) }
+        try await ShortMaker.export(source: source, segment: EditSegment(mediaID: imported.id, duration: 3,
+            captions: [viralCue], speechWords: viralWords, captionStyle: .viral), destination: viralURL)
+        // Yellow pixels mark the highlighted word; white and grey text do not match this test.
+        func yellowPixels(_ url: URL) throws -> (Int, CGImage) {
+            let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+            generator.requestedTimeToleranceBefore = .zero
+            generator.requestedTimeToleranceAfter = .zero
+            let frame = try generator.copyCGImage(at: CMTime(seconds: 0.65, preferredTimescale: 600), actualTime: nil)
+            let bitmap = NSBitmapImageRep(cgImage: frame)
+            var count = 0
+            for y in 1380..<1690 {
+                for x in 70..<1010 {
+                    guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { continue }
+                    if color.redComponent > 0.8 && color.greenComponent > 0.75 && color.blueComponent < 0.35 { count += 1 }
+                }
+            }
+            return (count, frame)
+        }
+        let (highlightPixels, viralFrame) = try yellowPixels(viralURL)
+        let viralImage = NSBitmapImageRep(cgImage: viralFrame).representation(using: .png, properties: [:])!
+        try FileManager.default.createDirectory(atPath: "test-output", withIntermediateDirectories: true)
+        try viralImage.write(to: URL(fileURLWithPath: "test-output/viral-caption-frame.png"))
+        precondition(highlightPixels > 20, "Viral style must highlight the spoken word in yellow when word timings exist")
+        try viralImage.write(to: root.appendingPathComponent("viral-caption-frame.png"))
+        print("PASS viral caption style highlights the current spoken word in yellow")
+        let untimedURL = root.appendingPathComponent("viral-caption-untimed.mp4")
+        try await ShortMaker.export(source: source, segment: EditSegment(mediaID: imported.id, duration: 3,
+            captions: [viralCue], captionStyle: .viral), destination: untimedURL)
+        let (untimedPixels, _) = try yellowPixels(untimedURL)
+        precondition(untimedPixels == 0, "Viral style must not guess highlights without real word timings")
+        print("PASS viral captions show without highlights when word timings are unavailable")
+        let english = ShortMaker.speechLocale(forText: "It turns out that these tanks give away exactly how much oil is inside of them.")
+        let spanish = ShortMaker.speechLocale(forText: "Resulta que estos tanques revelan exactamente cuánto petróleo hay dentro de ellos.")
+        precondition(english?.language.languageCode?.identifier == "en" && spanish?.language.languageCode?.identifier == "es",
+                     "Word timing must use the caption language, not only the Mac's language: \(String(describing: english)) \(String(describing: spanish))")
+        print("PASS on-device word timing picks the recognizer language from caption text")
+        func captionArea(_ url: URL, _ seconds: Double) throws -> [UInt8] {
+            let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+            generator.requestedTimeToleranceBefore = .zero
+            generator.requestedTimeToleranceAfter = .zero
+            let frame = try generator.copyCGImage(at: CMTime(seconds: seconds, preferredTimescale: 600), actualTime: nil)
+            let crop = frame.cropping(to: CGRect(x: 70, y: 1380, width: 940, height: 330))!
+            var bytes = [UInt8](repeating: 0, count: 256 * 90)
+            bytes.withUnsafeMutableBytes { buffer in
+                let context = CGContext(data: buffer.baseAddress, width: 256, height: 90, bitsPerComponent: 8,
+                    bytesPerRow: 256, space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue)!
+                context.draw(crop, in: CGRect(x: 0, y: 0, width: 256, height: 90))
+            }
+            return bytes
+        }
+        func meanDifference(_ a: [UInt8], _ b: [UInt8]) -> Double {
+            Double(zip(a, b).reduce(0) { $0 + abs(Int($1.0) - Int($1.1)) }) / Double(a.count)
+        }
+        let consecutive = root.appendingPathComponent("consecutive-captions.mp4")
+        let single = root.appendingPathComponent("single-caption.mp4")
+        let firstCue = TimedCaption(text: "FIRST PHRASE", start: 0.2, duration: 0.8)
+        let secondCue = TimedCaption(text: "SECOND PHRASE", start: 1.1, duration: 1.1)
+        try await ShortMaker.export(source: source, segment: EditSegment(mediaID: imported.id, duration: 3, captions: [firstCue, secondCue]), destination: consecutive)
+        try await ShortMaker.export(source: source, segment: EditSegment(mediaID: imported.id, duration: 3, captions: [secondCue]), destination: single)
+        // Keep the same Core Animation color pipeline in the empty reference.
+        // Comparing with a render that has no animation tool also measures color conversion.
+        let emptyReference = root.appendingPathComponent("empty-caption-reference.mp4")
+        try await ShortMaker.export(source: source, segment: EditSegment(mediaID: imported.id, duration: 3,
+            caption: "Future caption", captionStart: 2.9, captionDuration: 0.05), destination: emptyReference)
+        let activeDifference = meanDifference(try captionArea(consecutive, 1.5), try captionArea(single, 1.5))
+        let afterDifference = meanDifference(try captionArea(consecutive, 2.7), try captionArea(emptyReference, 2.7))
+        precondition(activeDifference < 2 && afterDifference < 2, "Earlier captions remained visible: active=\(activeDifference), after=\(afterDifference)")
+        print("PASS full caption area: consecutive phrases replace each other and disappear after their interval")
+
+        let combinedURL = root.appendingPathComponent("combined-captions.mp4")
+        let combinedSegment = EditSegment(
+            mediaID: imported.id,
+            duration: 3,
+            caption: "Editable title",
+            captionStart: 1,
+            captionDuration: 1,
+            captions: [TimedCaption(text: "Spoken subtitle", start: 1, duration: 1)]
+        )
+        try await ShortMaker.export(source: source, segment: combinedSegment, destination: combinedURL)
+        let combinedGenerator = AVAssetImageGenerator(asset: AVURLAsset(url: combinedURL))
+        let combinedFrame = try combinedGenerator.copyCGImage(at: CMTime(seconds: 1.5, preferredTimescale: 600), actualTime: nil)
+        try NSBitmapImageRep(cgImage: combinedFrame).representation(using: .jpeg, properties: [.compressionFactor: 0.85])!
+            .write(to: root.appendingPathComponent("combined-captions-frame.jpg"))
+        print("PASS text overlay and generated subtitles export together")
+        let exported = AVURLAsset(url: output)
+        let duration = try await exported.load(.duration).seconds
+        guard let video = try await exported.loadTracks(withMediaType: .video).first else { fatalError("No exported video") }
+        let size = try await video.load(.naturalSize)
+        let bytes = try output.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        precondition(Int(size.width) == 1080 && Int(size.height) == 1920)
+        precondition(abs(duration - 3) < 0.2 && bytes > 10_000)
+        print("PASS MP4 export: \(Int(size.width))×\(Int(size.height)), \(duration)s, \(bytes) bytes")
+        let artifacts = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("test-output")
+        try FileManager.default.createDirectory(at: artifacts, withIntermediateDirectories: true)
+        let combinedFrameArtifact = artifacts.appendingPathComponent("combined-captions-frame.jpg")
+        try? FileManager.default.removeItem(at: combinedFrameArtifact)
+        try FileManager.default.copyItem(at: root.appendingPathComponent("combined-captions-frame.jpg"), to: combinedFrameArtifact)
+        let viralFrameArtifact = artifacts.appendingPathComponent("viral-caption-frame.png")
+        try? FileManager.default.removeItem(at: viralFrameArtifact)
+        try FileManager.default.copyItem(at: root.appendingPathComponent("viral-caption-frame.png"), to: viralFrameArtifact)
+        let saved = artifacts.appendingPathComponent("picture-short.mp4")
+        try? FileManager.default.removeItem(at: saved)
+        try FileManager.default.copyItem(at: output, to: saved)
+        let fixture = artifacts.appendingPathComponent("pictures.mov")
+        try? FileManager.default.removeItem(at: fixture)
+        try FileManager.default.copyItem(at: source, to: fixture)
+        let generator = AVAssetImageGenerator(asset: exported)
+        let frame = try generator.copyCGImage(at: CMTime(seconds: 1.5, preferredTimescale: 600), actualTime: nil)
+        let image = NSBitmapImageRep(cgImage: frame)
+        try image.representation(using: .jpeg, properties: [.compressionFactor: 0.85])!.write(to: artifacts.appendingPathComponent("picture-short-frame.jpg"))
+        print("Saved test-output/picture-short.mp4 and preview frame")
+    }
+    private static func makePictureVideo(at url: URL) async throws {
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: 640, AVVideoHeightKey: 360])
+        input.expectsMediaDataInRealTime = false
+        let attributes: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32ARGB, kCVPixelBufferWidthKey as String: 640, kCVPixelBufferHeightKey as String: 360, kCVPixelBufferCGImageCompatibilityKey as String: true]
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: attributes)
+        writer.add(input)
+        guard writer.startWriting() else { throw writer.error ?? NSError(domain: "RelioSmoke", code: 1) }
+        writer.startSession(atSourceTime: .zero)
+        for frame in 0..<120 {
+            while !input.isReadyForMoreMediaData { try await Task.sleep(for: .milliseconds(10)) }
+            var buffer: CVPixelBuffer?
+            CVPixelBufferCreate(kCFAllocatorDefault, 640, 360, kCVPixelFormatType_32ARGB, attributes as CFDictionary, &buffer)
+            guard let pixel = buffer else { fatalError("No pixel buffer") }
+            CVPixelBufferLockBaseAddress(pixel, [])
+            let color: NSColor = frame < 40 ? .systemRed : frame < 80 ? .systemGreen : .systemBlue
+            let context = CGContext(data: CVPixelBufferGetBaseAddress(pixel), width: 640, height: 360, bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(pixel), space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue)!
+            context.setFillColor(color.cgColor)
+            context.fill(CGRect(x: 0, y: 0, width: 640, height: 360))
+            context.setFillColor(NSColor.white.cgColor)
+            context.fill(CGRect(x: 80 + frame % 80, y: 100, width: 140, height: 140))
+            CVPixelBufferUnlockBaseAddress(pixel, [])
+            guard adaptor.append(pixel, withPresentationTime: CMTime(value: Int64(frame), timescale: 30)) else { throw writer.error ?? NSError(domain: "RelioSmoke", code: 2) }
+        }
+        input.markAsFinished()
+        await writer.finishWriting()
+        guard writer.status == .completed else { throw writer.error ?? NSError(domain: "RelioSmoke", code: 3) }
+    }
+}
