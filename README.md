@@ -1,23 +1,35 @@
 <p align="center">
-  <img src="assets/RelioLogo.png" width="96" alt="Prism logo">
-</p>
-
-<h1 align="center">Prism</h1>
-
-<p align="center">
-  <b>Turn one long video into vertical Shorts with complete stories, captions and framing.</b><br>
-  A native macOS editor powered by Gemini.
+  <img src="macOS/assets/readme/hero.png" width="100%" alt="Prism: one in, many out. A native macOS editor that turns one long video into vertical Shorts.">
 </p>
 
 <p align="center">
-  macOS 14+ · Swift 6 · SwiftUI · AVFoundation · Gemini · MIT
+  <img src="https://img.shields.io/badge/macOS-14%2B-0E0F14?style=flat-square&labelColor=20232B" alt="macOS 14+">
+  <img src="https://img.shields.io/badge/Swift-6-0E0F14?style=flat-square&labelColor=20232B" alt="Swift 6">
+  <img src="https://img.shields.io/badge/AI-Gemini-3FA9F5?style=flat-square&labelColor=20232B" alt="Gemini">
+  <img src="https://img.shields.io/badge/license-MIT-0E0F14?style=flat-square&labelColor=20232B" alt="MIT">
 </p>
 
----
+<p align="center">
+  <a href="#quick-start"><b>Quick start</b></a> ·
+  <a href="#how-a-short-is-made"><b>How it works</b></a> ·
+  <a href="#privacy-and-cost"><b>Privacy</b></a> ·
+  <a href="#testing"><b>Testing</b></a>
+</p>
 
 Drop in a podcast, lecture, vlog or stream. Prism finds the moments that work as standalone Shorts: each one opens on a hook, keeps its context and ends on the payoff. It renders them as 1080 × 1920 MP4s with captions and a crop that follows the speaker. You review and tweak every clip before export.
 
 > **Status:** early Phase 1 prototype. The core long-video-to-Short pipeline works end to end; see [Limits](#limits) before relying on it.
+
+## The editor
+
+<p align="center"><img src="macOS/assets/readme/editor.png" width="100%" alt="The Prism editor: Shorts list, vertical preview with highlighted captions, clip inspector and timeline."></p>
+
+<p align="center">
+  <img src="macOS/assets/readme/home.png" width="49%" alt="Home: recent projects with thumbnails.">
+  <img src="macOS/assets/readme/create.png" width="49%" alt="Create: choose how many Shorts, their length and the source range.">
+</p>
+
+<sub>Screens use a generated demo library with illustrated footage. Regenerate them with <code>zsh macOS/scripts/readme-assets.sh</code>.</sub>
 
 ## Contents
 
@@ -52,8 +64,8 @@ Drop in a podcast, lecture, vlog or stream. Prism finds the moments that work as
 
 ```sh
 git clone <this repo> && cd Relio
-zsh scripts/package-app.sh
-open dist/Prism.app
+zsh macOS/scripts/package-app.sh
+open macOS/dist/Prism.app
 ```
 
 1. Open **Settings → AI & Cloud**, paste your API key and choose **Save key**. Use **Test connection** to check it.
@@ -62,7 +74,7 @@ open dist/Prism.app
 4. Pick a caption style and video type, then generate. You can cancel at any time; existing clips are kept.
 5. Review each Short in the editor and adjust it, then **Export**. Each Short becomes its own MP4 in the project's `Exports/` folder.
 
-> **Keychain prompts after every rebuild?** Run `zsh scripts/create-signing-identity.sh` once. See [Packaging and signing](#packaging-and-signing).
+> **Keychain prompts after every rebuild?** Run `zsh macOS/scripts/create-signing-identity.sh` once. See [Packaging and signing](#packaging-and-signing).
 
 ## How a Short is made
 
@@ -80,7 +92,7 @@ source video
    └─ 9. Render       AVFoundation, H.264, 1080 × 1920, on your Mac
 ```
 
-Selection adapts the score → shortlist → detail pipeline from [OpenShorts](THIRD-PARTY-NOTICES.md) (MIT) into native Swift, with no Python or Docker. A few design choices:
+Selection adapts the score → shortlist → detail pipeline from [OpenShorts](macOS/THIRD-PARTY-NOTICES.md) (MIT) into native Swift, with no Python or Docker. A few design choices:
 
 - **The whole range is scored**, so a strong moment late in a long recording is not lost to an early one.
 - **One failed batch costs only its own candidates**, not the whole run.
@@ -130,7 +142,7 @@ Each edit segment stores the following. Projects from older versions remain read
 ## Code map
 
 ```
-Sources/RelioApp/
+macOS/Sources/RelioApp/
   RelioApp.swift            app model, project actions, home, settings, chat
   EditorWorkspace.swift     editor: media bin, player, inspector, timeline
   ShortMaker.swift          analysis pipeline, captions, AVFoundation composition and export
@@ -139,7 +151,7 @@ Sources/RelioApp/
   SubjectFraming.swift      Gemini subject location, scene-cut detection, camera path planner
   Core.swift                project store (SQLite), media inspection, data model
   Theme.swift               Prism design tokens and fonts
-Sources/CSQLite/            SQLite system module
+macOS/Sources/CSQLite/            SQLite system module
 ```
 
 ## Testing
@@ -148,30 +160,30 @@ Each test script compiles a small standalone runner with `swiftc`. No live API c
 
 | Command | Covers |
 |---|---|
-| `zsh scripts/smoke-test.sh` | Import, project persistence, range validation, export, Fit and Split layouts, every caption style. Writes `test-output/`. |
-| `zsh scripts/transcript-selection-test.sh` | Windows, batching, sentence and filler snapping, word alignment checks. |
-| `zsh scripts/gemini-selection-test.sh` | Ranking, late moments, backups, window clamping, timing recovery, quota handling, Gemini framing. Needs `test-output/pictures.mov` from the smoke test. |
-| `zsh scripts/framing-test.sh` | Camera planner stability, fast subjects, scene cuts and rendered cut timing. |
-| `zsh scripts/editor-model-test.sh` | Editor actions, undo, folders, rename, save and reopen, export. |
-| `zsh scripts/ui-smoke-test.sh` | Drives the installed `~/Applications/Prism.app` through its screens with System Events (needs Accessibility permission for your terminal). |
+| `zsh macOS/scripts/smoke-test.sh` | Import, project persistence, range validation, export, Fit and Split layouts, every caption style. Writes `macOS/test-output/`. |
+| `zsh macOS/scripts/transcript-selection-test.sh` | Windows, batching, sentence and filler snapping, word alignment checks. |
+| `zsh macOS/scripts/gemini-selection-test.sh` | Ranking, late moments, backups, window clamping, timing recovery, quota handling, Gemini framing. Needs `macOS/test-output/pictures.mov` from the smoke test. |
+| `zsh macOS/scripts/framing-test.sh` | Camera planner stability, fast subjects, scene cuts and rendered cut timing. |
+| `zsh macOS/scripts/editor-model-test.sh` | Editor actions, undo, folders, rename, save and reopen, export. |
+| `zsh macOS/scripts/ui-smoke-test.sh` | Drives the installed `~/Applications/Prism.app` through its screens with System Events (needs Accessibility permission for your terminal). |
 
 **End-to-end fixture.** After the smoke test:
 
-1. Run `zsh scripts/generate-speech-fixture.sh` to build a spoken video with two self-contained stories plus an intro and outro.
+1. Run `zsh macOS/scripts/generate-speech-fixture.sh` to build a spoken video with two self-contained stories plus an intro and outro.
 2. Run it through Prism. This uses your key and is billed normally.
-3. Check the exports with `zsh scripts/verify-speech-workflow.sh PROJECT_DIRECTORY`.
+3. Check the exports with `zsh macOS/scripts/verify-speech-workflow.sh PROJECT_DIRECTORY`.
 
 Mocks prove the logic, not clip quality. Judge real footage yourself.
 
 ## Packaging and signing
 
-`scripts/package-app.sh` builds a release binary and assembles `dist/Prism.app` with icon, fonts and notices. It signs the app with the first of these that is available:
+`macOS/scripts/package-app.sh` builds a release binary and assembles `macOS/dist/Prism.app` with icon, fonts and notices. It signs the app with the first of these that is available:
 
 1. `RELIO_SIGNING_IDENTITY`, if set. Uses the hardened runtime and a timestamp, for distribution.
-2. **Prism Local Signing**, if it is in your keychain. Create it once with `zsh scripts/create-signing-identity.sh`.
+2. **Prism Local Signing**, if it is in your keychain. Create it once with `zsh macOS/scripts/create-signing-identity.sh`.
 3. An ad-hoc signature. With this, macOS asks for Keychain access again after every rebuild.
 
-A stable identity lets the Keychain's **Always Allow** survive rebuilds. See [RELEASE-READINESS.md](RELEASE-READINESS.md) for launch gates.
+A stable identity lets the Keychain's **Always Allow** survive rebuilds. See [RELEASE-READINESS.md](macOS/RELEASE-READINESS.md) for launch gates.
 
 ## Limits
 
@@ -184,16 +196,20 @@ A stable identity lets the Keychain's **Always Allow** survive rebuilds. See [RE
 
 ## Brand
 
+<p align="center"><img src="macOS/assets/readme/brand.png" width="100%" alt="Prism palette and type: Ink, Paper, Sky, Coral, Amber; Space Grotesk, Sora, JetBrains Mono."></p>
+
 The Prism design system uses:
 
 - Ink `#0E0F14` as the background.
 - Sky `#3FA9F5` as the only action colour.
 - Space Grotesk for headlines, Sora for interface text and JetBrains Mono for timecodes. The fonts are in `packaging/Fonts` under the SIL Open Font License.
 
-Tokens live in `Sources/RelioApp/Theme.swift`.
+Tokens live in `macOS/Sources/RelioApp/Theme.swift`.
 
 Internal identifiers still say *Relio*, so existing projects, settings and the saved key keep working: bundle ID `app.relio.prototype`, the Application Support folder, the Keychain item and the target names.
 
 ## Credits and license
 
-Prism is MIT-licensed; see [LICENSE](LICENSE). Clip selection adapts [OpenShorts](THIRD-PARTY-NOTICES.md) (MIT). Fonts are under the SIL Open Font License.
+<p align="center"><img src="macOS/assets/readme/icon.png" width="64" alt="Prism icon"></p>
+
+Prism is MIT-licensed; see [LICENSE](LICENSE). Clip selection adapts [OpenShorts](macOS/THIRD-PARTY-NOTICES.md) (MIT). Fonts are under the SIL Open Font License.
