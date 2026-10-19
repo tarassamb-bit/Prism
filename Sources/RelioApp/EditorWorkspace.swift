@@ -30,8 +30,8 @@ extension ContentView {
                     .help("Prism saves every change to this project automatically")
             }
             if model.isBusy { ProgressView().controlSize(.small) }
-            Label(model.isBusy ? model.generationStage : (model.useGemini ? "Gemini cloud" : "On-device AI"),
-                  systemImage: model.isBusy ? "clock" : (model.useGemini ? "cloud" : "desktopcomputer"))
+            Label(model.isBusy ? model.generationStage : "Gemini cloud",
+                  systemImage: model.isBusy ? "clock" : "cloud")
                 .font(Prism.text(12)).foregroundStyle(Prism.textSecondary).lineLimit(1)
             Button { model.revealExports() } label: {
                 Label("Exports", systemImage: "folder")
@@ -305,7 +305,7 @@ private struct EditorCaptionsPanel: View {
             }
             if current.usesWordTiming && clip.speechWords?.isEmpty != false {
                 Text(model.isBusy
-                     ? "Timing the words on this Mac so captions follow the speech…"
+                     ? "Gemini is timing the words so captions follow the speech…"
                      : "\(current.title) follows each spoken word, which needs word timing this Short doesn't have. Transcribe it to add timing; until then captions show as whole phrases.")
                     .font(Prism.text(11)).foregroundStyle(Prism.amber).fixedSize(horizontal: false, vertical: true)
             }
@@ -337,7 +337,7 @@ private struct EditorCaptionsPanel: View {
                 .disabled(model.isBusy || !hasAudio)
                 .accessibilityLabel("Transcribe speech into captions")
                 .help(hasAudio
-                      ? (model.useGemini ? "Transcribe with Gemini in the cloud. Google API usage may incur charges." : "Transcribe on this Mac. Audio stays on this Mac.")
+                      ? "Transcribe with Gemini in the cloud. Google API usage may incur charges."
                       : "This source video has no audio track.")
             }
             if cues.isEmpty {
@@ -689,7 +689,7 @@ private struct EditorInspector: View {
             if tab == "AI assistant" {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 12) {
-                        Text(model.useGemini ? "Gemini · Cloud" : model.aiModelName == "Not installed" ? "Built-in editing commands" : "\(model.aiModelName) · Local")
+                        Text("Gemini · Cloud")
                             .font(Prism.text(11)).foregroundStyle(EditorStyle.accent)
                         ForEach(model.chatMessages) { item in
                             Text(item.text).font(Prism.text(12)).padding(10)

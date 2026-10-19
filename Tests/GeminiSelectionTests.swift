@@ -249,6 +249,15 @@ final class TranscriptBox: @unchecked Sendable {
         export.outputURL = pipelineURL; export.outputFileType = .mp4
         await export.export()
         precondition(export.status == .completed)
+        // Gemini framing: a subject reported on the right moves the crop right; a failed request holds the crop steady.
+        let framed: [String: Any] = ["wholeFrame": false, "frames": (0..<8).map { ["index": $0, "found": true, "center": 0.8, "width": 0.1, "faces": [0.8]] }]
+        GeminiMockProtocol.payloads = [String(decoding: try JSONSerialization.data(withJSONObject: framed), as: UTF8.self)]
+        let path = await SubjectFramer.analyze(pipelineURL, start: 0, duration: 4, zoom: 1.08, configuration: configuration, session: session)
+        precondition(!path.isEmpty && path.allSatisfy { $0.position > 0.6 }, "Gemini's subject position must steer the crop: \(path)")
+        GeminiMockProtocol.payloads = ["not json"]
+        let steady = await SubjectFramer.analyze(pipelineURL, start: 0, duration: 4, zoom: 1.08, configuration: configuration, session: session)
+        precondition(steady.isEmpty && GeminiMockProtocol.payloads.isEmpty, "A failed framing request must leave the crop steady")
+        print("PASS Gemini framing steers the crop and falls back to a steady crop on failure")
         let knownText = "Here is a complete story with a useful ending."
         GeminiMockProtocol.statuses = [200, 200, 200, 429]
         GeminiMockProtocol.payloads = [

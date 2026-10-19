@@ -325,13 +325,10 @@ enum GeminiSelection {
         } }
         for time in times {
             try Task.checkCancellation()
-            guard let frame = try? generator.copyCGImage(at: CMTime(seconds: time, preferredTimescale: 600), actualTime: nil) else { continue }
-            let bytes = NSMutableData()
-            guard let encoder = CGImageDestinationCreateWithData(bytes, "public.jpeg" as CFString, 1, nil) else { continue }
-            CGImageDestinationAddImage(encoder, frame, [kCGImageDestinationLossyCompressionQuality: 0.65] as CFDictionary)
-            guard CGImageDestinationFinalize(encoder) else { continue }
+            guard let frame = try? generator.copyCGImage(at: CMTime(seconds: time, preferredTimescale: 600), actualTime: nil),
+                  let jpeg = jpegPart(frame) else { continue }
             parts.append(["text": "Frame at \(time) source seconds"])
-            parts.append(["inlineData": ["mimeType": "image/jpeg", "data": (bytes as Data).base64EncodedString()]])
+            parts.append(jpeg)
         }
         guard !transcript.isEmpty || parts.count > 1 else { throw Failure.invalidResponse }
         let schema: [String: Any] = ["type": "OBJECT", "properties": ["clips": ["type": "ARRAY", "items": [
@@ -369,6 +366,15 @@ enum GeminiSelection {
             if let text = detail["retryDelay"] as? String, text.hasSuffix("s"), let seconds = Double(text.dropLast()) { return seconds }
         }
         return nil
+    }
+
+    /// A frame as an inline JPEG request part; nil when encoding fails.
+    static func jpegPart(_ image: CGImage) -> [String: Any]? {
+        let bytes = NSMutableData()
+        guard let encoder = CGImageDestinationCreateWithData(bytes, "public.jpeg" as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(encoder, image, [kCGImageDestinationLossyCompressionQuality: 0.65] as CFDictionary)
+        guard CGImageDestinationFinalize(encoder) else { return nil }
+        return ["inlineData": ["mimeType": "image/jpeg", "data": (bytes as Data).base64EncodedString()]]
     }
 
     static func generate<T: Decodable>(parts: [[String: Any]], schema: [String: Any],

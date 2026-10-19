@@ -30,7 +30,7 @@ Tested `~/Downloads/video-1790957260292.mp4`: 1280 × 720, 798.58 seconds, with 
 
 Outputs are in `test-output/downloads-video-test-20261004-fit/`. Desktop automation could not initialize. Speech recognition could not run in the command-line harness because macOS attributed the privacy request to the terminal host without a speech usage description. No speech permissions were changed. These tests explicitly disable transcription and validate fallback selection; they do not validate moment quality, subtitles, or desktop interaction.
 
-Repeat with `zsh scripts/real-video-test.sh SOURCE_VIDEO NEW_OUTPUT_DIRECTORY`. This copies the source into a new test project and exports three Shorts plus a full-frame alternative.
+(`scripts/real-video-test.sh` was removed on October 19, 2026, with the on-device pipeline it exercised.)
 
 ## Real-video regression — October 11, 2026
 

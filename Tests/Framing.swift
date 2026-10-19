@@ -47,18 +47,6 @@ import AppKit
             else { precondition(color.blueComponent > 0.8 && color.redComponent < 0.2, "Export failed to switch on the cut") }
         }
         print("PASS rendered MP4 holds before a cut and switches immediately after it")
-        if CommandLine.arguments.count >= 4 {
-            let footage = URL(fileURLWithPath: CommandLine.arguments[1])
-            let start = Double(CommandLine.arguments[2])!
-            let duration = Double(CommandLine.arguments[3])!
-            let path = await ShortMaker.analyzeSubjectPath(footage, start: start, duration: duration)
-            let json = try JSONEncoder().encode(path)
-            try json.write(to: root.appendingPathComponent("subject-path.json"))
-            let review = root.appendingPathComponent("real-footage.mp4")
-            try await ShortMaker.export(source: footage, segment: EditSegment(mediaID: UUID(), start: start, duration: duration, cropKeyframes: path), destination: review)
-            print("REAL: \(path.count) points, \(path.filter { $0.isSceneCut == true }.count) scene cuts, positions \(path.map(\.position).min() ?? 0)...\(path.map(\.position).max() ?? 0)")
-            print("REVIEW: \(review.path)")
-        }
         print("ARTIFACTS: \(root.path)")
     }
 

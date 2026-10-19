@@ -68,21 +68,11 @@ import AppKit
         } catch { }
         precondition(model.project?.segments.count == 2 && model.editHistory.count == undoCount,
                      "Failed persistence must restore both clips and undo state")
-        model.useGemini = false
-        model.shortDuration = 1
-        model.shortCount = 1
-        model.makeConfiguredShorts()
-        model.cancelGeneration()
-        let cancellationDeadline = Date().addingTimeInterval(30)
-        while model.isBusy && Date() < cancellationDeadline { try await Task.sleep(for: .milliseconds(100)) }
-        precondition(!model.isBusy && model.project?.segments.count == 2 && model.message.contains("cancelled"),
-                     "Cancellation must retain all existing edits and release the busy state")
         model.project?.segments = []
         model.editHistory = []
         try model.save()
         print("PASS generated batches preserve previous edits, deduplicate and persist undo history")
-        // Exercise the native framing path used by cloud mode; this does not make API calls.
-        model.useGemini = true
+        // Manual clips keep their saved framing; this does not make API calls.
         model.shortDuration = 3
         model.addManualClip()
         await waitForPreview(model)

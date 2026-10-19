@@ -37,7 +37,7 @@ struct EditSegment: Identifiable, Codable, Hashable {
     var cropKeyframes: [CropKeyframe]? = nil
     /// Tracker algorithm version used to create cropKeyframes; old paths are regenerated on next preview/export.
     var cropTrackingVersion: Int? = nil
-    /// On-device word timings, relative to this Short, used to keep trims from clipping speech.
+    /// Gemini word timings, relative to this Short, used to keep trims from clipping speech.
     var speechWords: [TimedSpeechWord]? = nil
 
     var suggestedTitle: String? = nil
@@ -330,45 +330,6 @@ struct MachineProfile {
         let usedPages = totalPages > availablePages ? totalPages - availablePages : 0
         let usedBytes = usedPages * pageSize
         return min(Double(totalBytes) / 1_073_741_824, Double(usedBytes) / 1_073_741_824)
-    }
-}
-
-protocol RelioModel {
-    var displayName: String { get }
-    func analyzeImage(_ image: NSImage) async throws -> String
-    func analyzeFrames(_ images: [NSImage]) async throws -> [String]
-    func analyzeScene(_ descriptions: [String]) async throws -> String
-    func analyzeTranscript(_ text: String) async throws -> String
-    func analyzeAudioContext(_ path: URL) async throws -> String
-    func scoreClip(_ media: MediaItem) async throws -> Int
-    func createEditPlan(_ media: [MediaItem], preferences: String) async throws -> [EditSegment]
-    func reviseEditPlan(_ plan: [EditSegment], instruction: String) async throws -> [EditSegment]
-    func searchProject(_ query: String, media: [MediaItem]) async throws -> [MediaItem]
-    func chatAboutProject(_ question: String, media: [MediaItem]) async throws -> String
-}
-
-// The bundled planner works offline. Future downloaded model adapters can conform to RelioModel.
-struct LocalPlanner: RelioModel {
-    let displayName = "Relio AI Lite"
-    func analyzeImage(_ image: NSImage) async throws -> String { "Photo \(Int(image.size.width)) × \(Int(image.size.height))" }
-    func analyzeFrames(_ images: [NSImage]) async throws -> [String] { try await images.asyncMap { try await analyzeImage($0) } }
-    func analyzeScene(_ descriptions: [String]) async throws -> String { descriptions.joined(separator: ", ") }
-    func analyzeTranscript(_ text: String) async throws -> String { String(text.prefix(300)) }
-    func analyzeAudioContext(_ path: URL) async throws -> String { "Audio: \(path.lastPathComponent)" }
-    func scoreClip(_ media: MediaItem) async throws -> Int { media.priority }
-    func createEditPlan(_ media: [MediaItem], preferences: String) async throws -> [EditSegment] {
-        media.sorted { $0.created < $1.created }.map { .init(mediaID: $0.id, duration: $0.kind == "video" ? min($0.duration, 8) : 3) }
-    }
-    func reviseEditPlan(_ plan: [EditSegment], instruction: String) async throws -> [EditSegment] { plan }
-    func searchProject(_ query: String, media: [MediaItem]) async throws -> [MediaItem] { media.filter { $0.name.localizedCaseInsensitiveContains(query) || $0.note.localizedCaseInsensitiveContains(query) } }
-    func chatAboutProject(_ question: String, media: [MediaItem]) async throws -> String { "This project contains \(media.count) media items. Local language model support can be added through a model adapter." }
-}
-
-extension Array {
-    func asyncMap<T>(_ transform: (Element) async throws -> T) async throws -> [T] {
-        var values: [T] = []
-        for item in self { values.append(try await transform(item)) }
-        return values
     }
 }
 

@@ -70,7 +70,6 @@ final class AppModel {
     let machine = MachineProfile.detect()
     var creatorPreferences = ""
     var sourcePath = ""
-    var useGemini = UserDefaults.standard.bool(forKey: "shorts.useGemini")
     var geminiModel = UserDefaults.standard.string(forKey: "shorts.geminiModel") ?? "gemini-3.1-flash-lite"
     var geminiKey = ""
     var revealedGeminiKey = ""
@@ -121,8 +120,7 @@ final class AppModel {
         .init(isUser: false, text: "Tell me what you want to make. I can analyze the imported video, plan a Short, and prepare it for export.")
     ]
     var editHistory: [[EditSegment]] = []
-    var editingAIName: String { useGemini ? "Gemini" : LocalAIEngine.modelName }
-    var aiModelName: String { useGemini ? "Gemini · cloud" : LocalAIEngine.isInstalled ? LocalAIEngine.modelName : "Not installed" }
+    let editingAIName = "Gemini"
     var recentProjectPaths: [String] = UserDefaults.standard.stringArray(forKey: "recentProjects") ?? []
     let libraryURL: URL
 
@@ -155,7 +153,6 @@ final class AppModel {
                 geminiKeyStatus = "Saved key removed."
                 cachedGeminiKey = ""
             }
-            if saved { useGemini = true; UserDefaults.standard.set(true, forKey: "shorts.useGemini") }
             geminiKey = ""
             isEditingGeminiKey = false
             isShowingGeminiKey = false
@@ -185,6 +182,11 @@ final class AppModel {
         }
         revealedGeminiKey = savedKey
         isShowingGeminiKey = true
+    }
+    /// Gemini is Prism's only AI; nil when no key is saved.
+    func geminiConfiguration() -> GeminiConfiguration? {
+        let key = geminiAPIKey()
+        return key.isEmpty ? nil : .init(apiKey: key, model: geminiModel)
     }
     func geminiAPIKey() -> String {
         guard !didLoadGeminiKeyFromKeychain else { return cachedGeminiKey }
@@ -529,13 +531,13 @@ final class AppModel {
         selection = video.id
         player = nil
         isPreviewLoading = true
-        if segment.cropTrackingVersion != SubjectFramer.version && segment.splitScreen != true {
+        if segment.cropTrackingVersion != SubjectFramer.version && segment.splitScreen != true, let configuration = geminiConfiguration() {
             isBusy = true
             subjectTrackingRevision = revision
-            message = "Tracking the main visual subject…"
+            message = "Gemini is framing the main subject…"
             Task {
                 let path = await ShortMaker.analyzeSubjectPath(
-                    URL(fileURLWithPath: video.path), start: segment.start, duration: segment.duration, zoom: segment.cropZoom ?? 1.08, useSemanticModel: !useGemini
+                    URL(fileURLWithPath: video.path), start: segment.start, duration: segment.duration, zoom: segment.cropZoom ?? 1.08, configuration: configuration
                 )
                 guard revision == previewRevision, subjectTrackingRevision == revision,
                       let index = project?.segments.firstIndex(where: { $0.id == shortID }) else { return }
@@ -582,21 +584,16 @@ final class AppModel {
         if sourceRegion == .custom, let error = customRangeError { message = error; return }
         let customStart = sourceRegion == .custom ? minuteSeconds(customStartMinutes) : nil
         let customEnd = sourceRegion == .custom ? minuteSeconds(customEndMinutes) : nil
-        let configuration: GeminiConfiguration?
-        if useGemini {
-            let key = geminiAPIKey()
-            guard !key.isEmpty else {
-                message = "Add and save your Gemini key in Settings first."
-                generationError = "Gemini cloud is turned on, but no API key is saved. Add your key in Settings, or switch to on-device AI."
-                return
-            }
-            configuration = .init(apiKey: key, model: geminiModel)
-        } else { configuration = nil }
+        guard let configuration = geminiConfiguration() else {
+            message = "Add and save your Gemini key in Settings first."
+            generationError = "No Gemini API key is saved. Add your Google AI Studio key in Settings."
+            return
+        }
         isBusy = true; generationProgress = 0; generationError = nil; generationStage = "Preparing video"; message = "Preparing video analysis…"
         let sourceURL = URL(fileURLWithPath: video.path)
         let usedRanges = (project?.segments ?? []).filter { $0.mediaID == video.id }.map { SourceInterval(start: $0.start, end: $0.start + $0.duration) }
         var savedTranscript = project?.transcripts?[video.id.uuidString]
-        if savedTranscript == nil, configuration != nil, let earlier = transcriptFromOtherProjects(matching: video) {
+        if savedTranscript == nil, let earlier = transcriptFromOtherProjects(matching: video) {
             savedTranscript = earlier
             storeTranscript(earlier, for: video.id)
         }
@@ -616,17 +613,6 @@ final class AppModel {
                     onTranscript: { transcript in
                         Task { @MainActor in self.storeTranscript(transcript, for: video.id) }
                     },
-                    progress: { completed, total in
-                        Task { @MainActor in
-                            if completed >= total {
-                                self.message = configuration != nil ? "Gemini is analyzing stories and layouts…" : video.hasAudio == true
-                                    ? "Transcribing speech and ranking moments…"
-                                    : "Ranking visually interesting moments…"
-                            } else {
-                                self.message = "Analyzing video frames · \(min(completed + 1, total)) of \(total)…"
-                            }
-                        }
-                    },
                     generationProgress: { fraction, stage in
                         Task { @MainActor in
                             guard self.generationProgress != nil, self.generationStage != "Cancelling…" else { return }
@@ -645,26 +631,11 @@ final class AppModel {
                     if videoType == .podcast { segment.splitScreen = true; segment.captionPosition = .middle }
                     return segment
                 }
-                // Word-following styles need word timing; Gemini's often fails verification, so measure it on this Mac.
-                if configuration != nil, shortCaptionStyle.usesWordTiming {
-                    for index in candidates.indices where candidates[index].speechWords?.isEmpty != false && candidates[index].captions?.isEmpty == false {
-                        try Task.checkCancellation()
-                        generationStage = "Timing words on this Mac · Short \(index + 1) of \(candidates.count)"
-                        guard let timed = await ShortMaker.retimedOnDevice(
-                            url: sourceURL, start: candidates[index].start, duration: candidates[index].duration, sourceDuration: video.duration,
-                            languageHint: candidates[index].captions?.map(\.text).joined(separator: " ")) else { continue }
-                        // The cut moves onto whole words, as in the Gemini path; Gemini's end can fall inside a word.
-                        candidates[index].start = timed.start
-                        candidates[index].duration = timed.duration
-                        candidates[index].captions = timed.cues
-                        candidates[index].speechWords = timed.words
-                        candidates[index].captionNotice = nil
-                    }
-                }
                 for index in candidates.indices where candidates[index].splitScreen == true {
                     try Task.checkCancellation()
-                    generationStage = "Finding both speakers · Short \(index + 1) of \(candidates.count)"
-                    candidates[index].splitCenters = await ShortMaker.findSplitCenters(sourceURL, start: candidates[index].start, duration: candidates[index].duration)
+                    generationStage = "Gemini · finding both speakers · Short \(index + 1) of \(candidates.count)"
+                    candidates[index].splitCenters = await ShortMaker.findSplitCenters(sourceURL, start: candidates[index].start, duration: candidates[index].duration,
+                                                                                       configuration: configuration)
                 }
                 try Task.checkCancellation()
                 let fresh = try appendGeneratedShorts(candidates)
@@ -674,10 +645,8 @@ final class AppModel {
                     generationProgress = nil; generationTask = nil; isBusy = false
                     return
                 }
-                let actualLength = results.first?.duration ?? duration
-                message = "Analyzed the video and created \(fresh.count) Shorts at about \(formatSeconds(actualLength)) each. Framing follows the main subject, holds steady while it is framed, and resets on scene cuts. Review and export."
+                message = "Gemini selected \(fresh.count) complete clip ranges and layouts. Review framing and captions before export."
                 let warning = results.compactMap(\.analysisWarning).first
-                if configuration != nil { message = "Gemini selected \(fresh.count) complete clip ranges and layouts. Review framing and captions before export." }
                 if let warning { message += " " + warning }
                 chatMessages.append(.init(isUser: false, text: message))
                 selectPreview(fresh.first?.id)
@@ -738,10 +707,10 @@ final class AppModel {
                     generationStage = "Exporting Short \(index + 1) of \(segments.count)"
                     var segment = originalSegment
                     guard let video = media.first(where: { $0.id == segment.mediaID }) else { throw ShortMaker.Failure.noVideo }
-                    if segment.cropTrackingVersion != SubjectFramer.version && segment.splitScreen != true {
-                        message = "Tracking subject in Short \(index + 1) of \(segments.count)…"
+                    if segment.cropTrackingVersion != SubjectFramer.version && segment.splitScreen != true, let configuration = geminiConfiguration() {
+                        message = "Gemini is framing Short \(index + 1) of \(segments.count)…"
                         segment.cropKeyframes = await ShortMaker.analyzeSubjectPath(
-                            URL(fileURLWithPath: video.path), start: segment.start, duration: segment.duration, zoom: segment.cropZoom ?? 1.08, useSemanticModel: !useGemini
+                            URL(fileURLWithPath: video.path), start: segment.start, duration: segment.duration, zoom: segment.cropZoom ?? 1.08, configuration: configuration
                         )
                         segment.cropTrackingVersion = SubjectFramer.version
                         if let storedIndex = project?.segments.firstIndex(where: { $0.id == segment.id }) {
@@ -877,10 +846,12 @@ final class AppModel {
             }
             return
         }
+        guard let configuration = geminiConfiguration() else { message = "Save your Google AI Studio key in Settings first."; return }
         isBusy = true
-        message = "Finding both speakers…"
+        message = "Gemini is finding both speakers…"
         Task {
-            let centers = await ShortMaker.findSplitCenters(URL(fileURLWithPath: video.path), start: segment.start, duration: segment.duration)
+            let centers = await ShortMaker.findSplitCenters(URL(fileURLWithPath: video.path), start: segment.start, duration: segment.duration,
+                                                           configuration: configuration)
             isBusy = false
             guard previewShortID == segment.id else { return }
             _ = applyEdit { segment, _ in
@@ -909,42 +880,21 @@ final class AppModel {
             return
         }
         let segmentID = segment.id
-        let configuration: GeminiConfiguration?
-        if useGemini {
-            let key = geminiAPIKey()
-            guard !key.isEmpty else { message = "Save your Google AI Studio key in Settings first."; return }
-            configuration = .init(apiKey: key, model: geminiModel)
-        } else { configuration = nil }
+        guard let configuration = geminiConfiguration() else { message = "Save your Google AI Studio key in Settings first."; return }
         isBusy = true
-        message = configuration == nil ? "Transcribing this Short locally…" : "Gemini is transcribing this Short…"
+        message = "Gemini is transcribing this Short…"
         Task {
-            var result: CaptionGenerationResult
+            let result: CaptionGenerationResult
             do {
-                if let configuration {
-                    let cloud = try await GeminiSelection.regenerateCaptions(url: URL(fileURLWithPath: video.path),
-                        interval: (segment.start, segment.start + segment.duration), configuration: configuration)
-                    let relativeWords = cloud.words.map { TimedSpeechWord(text: $0.text, start: $0.start - segment.start, duration: $0.duration) }
-                    let relativeCues = cloud.cues.map { TimedCaption(text: $0.text, start: $0.start - segment.start, duration: $0.duration) }
-                    result = .init(cues: relativeCues, issue: relativeCues.isEmpty ? .noSpeech : nil, words: relativeWords, notice: cloud.notice)
-                } else {
-                    result = await ShortMaker.captions(for: URL(fileURLWithPath: video.path), start: segment.start, duration: segment.duration)
-                }
+                let cloud = try await GeminiSelection.regenerateCaptions(url: URL(fileURLWithPath: video.path),
+                    interval: (segment.start, segment.start + segment.duration), configuration: configuration)
+                let relativeWords = cloud.words.map { TimedSpeechWord(text: $0.text, start: $0.start - segment.start, duration: $0.duration) }
+                let relativeCues = cloud.cues.map { TimedCaption(text: $0.text, start: $0.start - segment.start, duration: $0.duration) }
+                result = .init(cues: relativeCues, issue: relativeCues.isEmpty ? .noSpeech : nil, words: relativeWords, notice: cloud.notice)
             } catch {
                 isBusy = false
                 message = "Could not transcribe Short: \(error.localizedDescription)"
                 return
-            }
-            // Gemini word timestamps often fail verification; measure word timing from the audio on this Mac instead.
-            if configuration != nil, result.words.isEmpty, !result.cues.isEmpty {
-                message = "Measuring word timing on this Mac…"
-                let local = await ShortMaker.captions(for: URL(fileURLWithPath: video.path), start: segment.start, duration: segment.duration,
-                                                      languageHint: result.cues.map(\.text).joined(separator: " "))
-                if !local.words.isEmpty {
-                    result = local
-                } else {
-                    let reason = "Word timing on this Mac failed: \(local.issue?.message ?? CaptionGenerationIssue.noSpeech.message)"
-                    result.notice = [result.notice, reason].compactMap { $0 }.joined(separator: " ")
-                }
             }
             guard previewShortID == segmentID,
                   let index = project?.segments.firstIndex(where: { $0.id == segmentID }) else {
@@ -1009,10 +959,6 @@ final class AppModel {
             segment.captionStyle = style
             return "\(style.title) subtitles applied."
         }) { message = reply }
-        // Word-following styles need word timing; measure it now rather than waiting for the person to press Transcribe.
-        if style.usesWordTiming, let segment = activeSegment, segment.speechWords?.isEmpty != false, segment.captions?.isEmpty == false {
-            timeSelectedShortWords()
-        }
     }
 
     /// Subtitle placement, size and pop-in for the selected Short; nil leaves that setting unchanged.
@@ -1024,40 +970,6 @@ final class AppModel {
             if let animated { segment.captionAnimated = animated }
             return "Subtitle layout saved."
         }) { message = reply }
-    }
-
-    /// Measures word timing on this Mac for the selected Short and moves its cuts onto whole words.
-    func timeSelectedShortWords() {
-        guard !isBusy, let segment = activeSegment,
-              let video = project?.media.first(where: { $0.id == segment.mediaID }) else { return }
-        let segmentID = segment.id
-        isBusy = true
-        message = "Timing words on this Mac for yellow highlights…"
-        Task {
-            let timed = await ShortMaker.retimedOnDevice(url: URL(fileURLWithPath: video.path), start: segment.start, duration: segment.duration,
-                                                         sourceDuration: video.duration,
-                                                         languageHint: segment.captions?.map(\.text).joined(separator: " "))
-            isBusy = false
-            guard let index = project?.segments.firstIndex(where: { $0.id == segmentID }) else { return }
-            guard let timed else {
-                message = "Couldn't time the words on this Mac, so captions show without highlights. Try Transcribe in the Captions tab."
-                return
-            }
-            editHistory.append(project?.segments ?? [])
-            project?.segments[index].start = timed.start
-            project?.segments[index].duration = timed.duration
-            project?.segments[index].captions = timed.cues
-            project?.segments[index].speechWords = timed.words
-            project?.segments[index].captionNotice = nil
-            do {
-                try save()
-                if previewShortID == segmentID { selectPreview(segmentID) }
-                message = "Word timing ready. Spoken words now turn yellow."
-            } catch {
-                if let previous = editHistory.popLast() { project?.segments = previous }
-                message = "Could not save word timing: \(error.localizedDescription)"
-            }
-        }
     }
 
     /// Replaces caption wording only; timings stay. An empty line removes that caption.
@@ -1243,46 +1155,33 @@ final class AppModel {
             chatMessages.append(.init(isUser: false, text: "Import a video first, then I can edit it."))
             return
         }
-        let configuration: GeminiConfiguration?
-        if useGemini {
-            let key = geminiAPIKey()
-            guard !key.isEmpty else {
-                message = "Save your Google AI Studio key in Settings first."
-                chatMessages.append(.init(isUser: false, text: message))
-                return
-            }
-            configuration = .init(apiKey: key, model: geminiModel)
-        } else { configuration = nil }
+        guard let configuration = geminiConfiguration() else {
+            message = "Save your Google AI Studio key in Settings first."
+            chatMessages.append(.init(isUser: false, text: message))
+            return
+        }
         isBusy = true
-        message = useGemini ? "Gemini is planning your edit…" : "\(LocalAIEngine.modelName) is thinking locally…"
+        message = "Gemini is planning your edit…"
         Task {
             do {
                 let media = project?.media.first
                 let segment = activeSegment ?? project?.segments.first
                 let summary = "video \(formatSeconds(media?.duration ?? 0)); current edit \(formatSeconds(segment?.duration ?? 0)); caption \(segment?.caption ?? "none")"
                 let conversation = chatMessages.dropLast().suffix(6).map { ($0.isUser ? "User: " : "Assistant: ") + $0.text }.joined(separator: " / ")
-                let command: LocalAICommand
-                if let configuration {
-                    let remote = try await GeminiSelection.interpret(text, summary: summary, conversation: conversation, configuration: configuration)
-                    command = .init(action: remote.action, arguments: remote.arguments)
-                } else {
-                    command = try await LocalAIEngine.interpret(text, projectSummary: summary, conversation: conversation)
-                }
+                let command = try await GeminiSelection.interpret(text, summary: summary, conversation: conversation, configuration: configuration)
                 isBusy = false
                 executeAICommand(command, originalRequest: text)
                 return
             } catch {
                 isBusy = false
-                if configuration != nil {
-                    message = "Gemini could not plan this edit: \(error.localizedDescription)"
-                    chatMessages.append(.init(isUser: false, text: message))
-                } else { handleFallback(text) }
+                message = "Gemini could not plan this edit: \(error.localizedDescription)"
+                chatMessages.append(.init(isUser: false, text: message))
                 return
             }
         }
     }
 
-    private func executeAICommand(_ command: LocalAICommand, originalRequest: String) {
+    private func executeAICommand(_ command: GeminiSelection.EditCommand, originalRequest: String) {
         func value(_ index: Int) -> Double? {
             guard command.arguments.indices.contains(index), let value = Double(command.arguments[index].trimmingCharacters(in: .whitespaces)), value.isFinite else { return nil }
             return value
@@ -1404,7 +1303,7 @@ final class AppModel {
             }}
             chatMessages.append(.init(isUser: false, text: reply ?? "Tell me a duration, for example “make it 20 seconds”."))
         } else if request.contains("short") || request.contains("analy") || request.contains("best moment") {
-            chatMessages.append(.init(isUser: false, text: "I’m analyzing the video locally and looking for a complete moment."))
+            chatMessages.append(.init(isUser: false, text: "Gemini is analyzing the video for a complete moment."))
             makeShort(requestedDuration: number(in: request, after: ["short", "make", "create"]))
         } else if request.contains("export") {
             let reply = project?.segments.isEmpty == false
@@ -1604,7 +1503,7 @@ struct ContentView: View {
                     Button { sidebarCollapsed = true } label: { Image(systemName: "sidebar.left") }.buttonStyle(.prismIcon)
                         .pointerFeedback().foregroundStyle(Prism.textSecondary).help("Collapse sidebar")
                 }
-        Text(model.useGemini ? "Your video editor · Cloud AI" : "Your video editor · On-device AI").font(Prism.text(12)).foregroundStyle(Prism.textSecondary)
+        Text("Your video editor · Cloud AI").font(Prism.text(12)).foregroundStyle(Prism.textSecondary)
             }
             Divider().padding(.vertical, 8)
             sidebarButton("Home", icon: "house.fill", selected: model.screen == .home) { model.screen = .home }
@@ -1713,9 +1612,7 @@ struct ContentView: View {
                     if selectedSettingsCategory == .aiCloud {
                         VStack(alignment: .leading, spacing: 18) {
                         Label("AI & Cloud", systemImage: "sparkles").font(Prism.display(20))
-                        Toggle("Use cloud AI", isOn: $model.useGemini)
-                            .onChange(of: model.useGemini) { _, value in UserDefaults.standard.set(value, forKey: "shorts.useGemini") }
-                        Text(model.useGemini ? "Gemini handles clip selection, transcription, subtitles and editor chat." : "Prism uses on-device analysis. Turn on cloud AI to use Gemini.")
+                        Text("Gemini handles clip selection, transcription, subtitles, framing and editor chat.")
                             .font(Prism.text(13)).foregroundStyle(Prism.textSecondary)
                         Divider()
                         Text("Google AI Studio API key").font(Prism.text(14, .medium))
@@ -2293,7 +2190,7 @@ struct ContentView: View {
                 }
             }
             if model.shortCaptionStyle.usesWordTiming {
-                Text("This style follows each spoken word. Prism measures word timing on this Mac; if a clip has none, its captions show as whole phrases.")
+                Text("This style follows each spoken word. Gemini times the words; if a clip has none, its captions show as whole phrases.")
                     .font(Prism.text(12)).foregroundStyle(Prism.textSecondary)
             }
         }

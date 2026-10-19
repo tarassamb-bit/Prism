@@ -64,21 +64,18 @@ import AppKit
                 fatalError("Invalid custom source range accepted")
             } catch ShortMaker.Failure.invalidRange { }
         }
+        // Both rejections happen before any Gemini request, so a placeholder key is never sent.
+        let offline = GeminiConfiguration(apiKey: "unused", model: "unused")
         do {
-            _ = try await ShortMaker.analyze(source, requestedDuration: 1, count: 1, sourceRegion: .custom, customStart: 0, customEnd: 60_000)
+            _ = try await ShortMaker.analyze(source, requestedDuration: 1, count: 1, sourceRegion: .custom, customStart: 0, customEnd: 60_000, gemini: offline)
             fatalError("Analysis must reject a custom end past the actual media duration")
         } catch ShortMaker.Failure.invalidRange { }
         do {
             _ = try await ShortMaker.analyze(source, requestedDuration: 1, count: 1, sourceRegion: .entireVideo,
-                excluding: [.init(start: 0, end: imported.duration)])
+                excluding: [.init(start: 0, end: imported.duration)], gemini: offline)
             fatalError("An entirely used source region must not generate fallback duplicates")
         } catch GeminiSelection.Failure.noDistinctClips { }
-        let halfSelections = try await ShortMaker.analyze(source, requestedDuration: 1, count: 1, sourceRegion: .lastHalf, transcriptionEnabled: false)
-        precondition(halfSelections.allSatisfy { $0.start >= imported.duration / 2 && $0.start + $0.duration <= imported.duration })
         print("PASS first/last half, fractional midpoint, custom range validation and actual source duration enforcement")
-        let selections = try await ShortMaker.analyze(source, requestedDuration: 1, count: 3, sourceRegion: .entireVideo)
-        precondition(selections.count == 3)
-        precondition(selections.allSatisfy { $0.start >= 0 && $0.start + $0.duration <= imported.duration })
         let rejected = root.appendingPathComponent("rejected.mp4")
         for bad in [EditSegment(mediaID: imported.id, start: -1, duration: 2),
                     EditSegment(mediaID: imported.id, duration: .nan),
@@ -96,7 +93,7 @@ import AppKit
         } catch ShortMaker.Failure.destinationExists { }
         let preserved = try Data(contentsOf: rejected)
         precondition(preserved == Data("preserve me".utf8))
-        print("PASS invalid import, selection bounds, invalid edits, and destination preservation")
+        print("PASS invalid import, invalid edits, and destination preservation")
         let output = root.appendingPathComponent("short.mp4")
         try await ShortMaker.export(source: source, segment: segment, destination: output)
         let plainURL = root.appendingPathComponent("plain.mp4")
@@ -177,23 +174,6 @@ import AppKit
         let (untimedPixels, _) = try yellowPixels(untimedURL)
         precondition(untimedPixels == 0, "Viral style must not guess highlights without real word timings")
         print("PASS viral captions show without highlights when word timings are unavailable")
-        let english = ShortMaker.speechLocale(forText: "It turns out that these tanks give away exactly how much oil is inside of them.")
-        let spanish = ShortMaker.speechLocale(forText: "Resulta que estos tanques revelan exactamente cuánto petróleo hay dentro de ellos.")
-        precondition(english?.language.languageCode?.identifier == "en" && spanish?.language.languageCode?.identifier == "es",
-                     "Word timing must use the caption language, not only the Mac's language: \(String(describing: english)) \(String(describing: spanish))")
-        print("PASS on-device word timing picks the recognizer language from caption text")
-        // Regression: Gemini ended a Short at 168.6 s while the on-device timing has "tank." finishing at 168.95 s.
-        // Re-timing must move the cut past that word instead of leaving the Short ending on "in the".
-        let spoken = [("It", 129.2, 0.4), ("turns", 129.7, 0.3), ("less", 166.0, 0.2), ("oil", 166.3, 0.2), ("is", 167.2, 0.15),
-                      ("present", 167.7, 0.5), ("in", 168.2, 0.15), ("the", 168.35, 0.15), ("tank.", 168.5, 0.45)]
-        let words = spoken.map { TimedSpeechWord(text: $0.0, start: $0.1, duration: $0.2) }
-        let snapped = ShortMaker.snappedToWords(start: 129.5, duration: 39.1, words: words, sourceDuration: 700)
-        precondition(snapped != nil && snapped!.words.last?.text == "tank." && snapped!.start + snapped!.duration >= 168.95,
-                     "Re-timed Shorts must not end in the middle of a word: \(String(describing: snapped))")
-        precondition(snapped!.start < 129.5 && snapped!.words.first?.text == "It", "A start inside a word must move to the word's beginning")
-        precondition(snapped!.cues.last?.text.hasSuffix("tank.") == true, "Caption groups must be rebuilt from the snapped words")
-        precondition(ShortMaker.snappedToWords(start: 10, duration: 5, words: [], sourceDuration: 100) == nil, "No words, no re-timing")
-        print("PASS on-device re-timing moves cuts onto whole words, so a Short no longer ends mid-word")
         // Every subtitle style renders. Word-following styles change with each word, Bold caps shows three words at a time,
         // and without word timing every style falls back to one whole phrase per caption.
         for style in CaptionStyle.allCases {

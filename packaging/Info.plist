@@ -1,15 +1,24 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <!-- The identifier keeps its original value so existing settings and the saved Gemini key stay reachable. -->
-  <key>CFBundleIdentifier</key><string>app.relio.prototype</string>
-  <key>CFBundleName</key><string>Prism</string>
-  <key>CFBundleDisplayName</key><string>Prism</string>
-  <key>CFBundleExecutable</key><string>Relio</string>
-  <key>CFBundleIconFile</key><string>Prism.icns</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
-  <key>CFBundleVersion</key><string>1</string>
-  <key>NSHighResolutionCapable</key><true/>
-  <key>NSSpeechRecognitionUsageDescription</key><string>Prism transcribes imported videos on this Mac to find a promising Short and create captions.</string>
-</dict></plist>
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>Prism</string>
+	<key>CFBundleExecutable</key>
+	<string>Relio</string>
+	<key>CFBundleIconFile</key>
+	<string>Prism.icns</string>
+	<key>CFBundleIdentifier</key>
+	<string>app.relio.prototype</string>
+	<key>CFBundleName</key>
+	<string>Prism</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+</dict>
+</plist>
