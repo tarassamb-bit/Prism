@@ -1,23 +1,35 @@
 <p align="center">
-  <img src="assets/RelioLogo.png" width="96" alt="Prism logo">
-</p>
-
-<h1 align="center">Prism</h1>
-
-<p align="center">
-  <b>Turn one long video into vertical Shorts with complete stories, captions and framing.</b><br>
-  A native macOS editor powered by Gemini.
+  <img src="assets/readme/hero.png" width="100%" alt="Prism: one in, many out. A native macOS editor that turns one long video into vertical Shorts.">
 </p>
 
 <p align="center">
-  macOS 14+ · Swift 6 · SwiftUI · AVFoundation · Gemini · MIT
+  <img src="https://img.shields.io/badge/macOS-14%2B-0E0F14?style=flat-square&labelColor=20232B" alt="macOS 14+">
+  <img src="https://img.shields.io/badge/Swift-6-0E0F14?style=flat-square&labelColor=20232B" alt="Swift 6">
+  <img src="https://img.shields.io/badge/AI-Gemini-3FA9F5?style=flat-square&labelColor=20232B" alt="Gemini">
+  <img src="https://img.shields.io/badge/license-MIT-0E0F14?style=flat-square&labelColor=20232B" alt="MIT">
 </p>
 
----
+<p align="center">
+  <a href="#quick-start"><b>Quick start</b></a> ·
+  <a href="#how-a-short-is-made"><b>How it works</b></a> ·
+  <a href="#privacy-and-cost"><b>Privacy</b></a> ·
+  <a href="#testing"><b>Testing</b></a>
+</p>
 
 Drop in a podcast, lecture, vlog or stream. Prism finds the moments that work as standalone Shorts: each one opens on a hook, keeps its context and ends on the payoff. It renders them as 1080 × 1920 MP4s with captions and a crop that follows the speaker. You review and tweak every clip before export.
 
 > **Status:** early Phase 1 prototype. The core long-video-to-Short pipeline works end to end; see [Limits](#limits) before relying on it.
+
+## The editor
+
+<p align="center"><img src="assets/readme/editor.png" width="100%" alt="The Prism editor: Shorts list, vertical preview with highlighted captions, clip inspector and timeline."></p>
+
+<p align="center">
+  <img src="assets/readme/home.png" width="49%" alt="Home: recent projects with thumbnails.">
+  <img src="assets/readme/create.png" width="49%" alt="Create: choose how many Shorts, their length and the source range.">
+</p>
+
+<sub>Screens use a generated demo library with illustrated footage. Regenerate them with <code>zsh scripts/readme-assets.sh</code>.</sub>
 
 ## Contents
 
@@ -184,6 +196,8 @@ A stable identity lets the Keychain's **Always Allow** survive rebuilds. See [RE
 
 ## Brand
 
+<p align="center"><img src="assets/readme/brand.png" width="100%" alt="Prism palette and type: Ink, Paper, Sky, Coral, Amber; Space Grotesk, Sora, JetBrains Mono."></p>
+
 The Prism design system uses:
 
 - Ink `#0E0F14` as the background.
@@ -195,5 +209,7 @@ Tokens live in `Sources/RelioApp/Theme.swift`.
 Internal identifiers still say *Relio*, so existing projects, settings and the saved key keep working: bundle ID `app.relio.prototype`, the Application Support folder, the Keychain item and the target names.
 
 ## Credits and license
+
+<p align="center"><img src="assets/readme/icon.png" width="64" alt="Prism icon"></p>
 
 Prism is MIT-licensed; see [LICENSE](LICENSE). Clip selection adapts [OpenShorts](THIRD-PARTY-NOTICES.md) (MIT). Fonts are under the SIL Open Font License.
