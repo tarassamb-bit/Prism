@@ -10,6 +10,7 @@ swiftc Sources/RelioApp/Core.swift Sources/RelioApp/ShortMaker.swift Sources/Rel
   Sources/RelioApp/SubjectFraming.swift Sources/RelioApp/EditorWorkspace.swift Sources/RelioApp/Theme.swift "$work/AppDeclarations.swift" \
   scripts/readme-assets/*.swift -Xcc -fmodule-map-file=Sources/CSQLite/module.modulemap -lsqlite3 -o "$work/readme-assets"
 mkdir -p "$work/home" assets/readme
-CFFIXED_USER_HOME="$work/home" "$work/readme-assets" "$work" assets/readme
+mkdir -p "$work/tmp"
+TMPDIR="$work/tmp" CFFIXED_USER_HOME="$work/home" "$work/readme-assets" "$work" assets/readme
 swift scripts/generate-icon.swift "$work/icon.png"
 sips -Z 256 "$work/icon.png" --out assets/readme/icon.png >/dev/null
