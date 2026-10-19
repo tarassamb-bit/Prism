@@ -132,6 +132,35 @@ extension ButtonStyle where Self == PrismButtonStyle {
     static var prismGhost: PrismButtonStyle { .init(kind: .ghost) }
 }
 
+/// Small icon or text buttons: a rounded box lights up on hover and takes clicks anywhere inside,
+/// not only on the glyph or letters. Icons get a 30pt square; text links get padding around the label.
+struct PrismIconButtonStyle: ButtonStyle {
+    var isLink = false
+    func makeBody(configuration: Configuration) -> some View { IconBody(configuration: configuration, isLink: isLink) }
+
+    private struct IconBody: View {
+        let configuration: Configuration
+        let isLink: Bool
+        @Environment(\.isEnabled) private var isEnabled
+        @State private var isHovering = false
+        var body: some View {
+            let shape = RoundedRectangle(cornerRadius: 8)
+            configuration.label
+                .frame(width: isLink ? nil : 30, height: isLink ? nil : 30)
+                .padding(.horizontal, isLink ? 8 : 0).padding(.vertical, isLink ? 5 : 0)
+                .background(configuration.isPressed ? Prism.surface2 : isHovering && isEnabled ? Prism.surface2.opacity(0.6) : .clear, in: shape)
+                .contentShape(shape)
+                .opacity(isEnabled ? 1 : 0.4)
+                .onHover { isHovering = $0 }
+        }
+    }
+}
+
+extension ButtonStyle where Self == PrismIconButtonStyle {
+    static var prismIcon: PrismIconButtonStyle { .init() }
+    static var prismLink: PrismIconButtonStyle { .init(isLink: true) }
+}
+
 /// Prism progress: one thin line, filled in the action color over a border-colored track.
 struct PrismProgressLine: View {
     let value: Double

@@ -10,7 +10,28 @@ import AppKit
         defer { try? FileManager.default.removeItem(at: root) }
         guard let media = await MediaEngine.inspect(source, thumbnailDirectory: root) else { fatalError("Fixture unavailable") }
         let store = try ProjectStore(root: root)
+        precondition(AppModel.exportFileName(title: "Oil: \"what's\" next?/now") == "Oil what's next now"
+                     && AppModel.exportFileName(title: " .. ") == nil && AppModel.exportFileName(title: nil) == nil
+                     && AppModel.exportFileName(title: String(repeating: "a", count: 200))?.count == 80,
+                     "Export names must drop path and Finder-unsafe characters")
+        print("PASS export file names come from Short titles")
         let model = AppModel()
+        let folderModel = AppModel()
+        folderModel.recentProjectPaths = ["/p/one.relio", "/p/two.relio"]
+        let podcasts = folderModel.createFolder(named: "  Podcasts  ")!, other = folderModel.createFolder(named: "Other")!
+        precondition(folderModel.createFolder(named: "   ") == nil)
+        folderModel.moveProject("/p/one.relio", toFolder: podcasts)
+        folderModel.moveProject("/p/one.relio", toFolder: other)
+        folderModel.moveProject("not a project", toFolder: other)
+        precondition(folderModel.projectFolders.first { $0.id == podcasts }?.projectPaths.isEmpty == true
+                     && folderModel.projectFolders.first { $0.id == other }?.projectPaths == ["/p/one.relio"],
+                     "A project lives in one folder at a time, and unknown drops are ignored")
+        folderModel.renameFolder(other, to: "Satellite")
+        folderModel.deleteFolder(other)
+        precondition(folderModel.projectFolders.map(\.name) == ["Podcasts"] && folderModel.recentProjectPaths.count == 2,
+                     "Deleting a folder keeps its projects")
+        folderModel.deleteFolder(podcasts)
+        print("PASS Home folders: create, move, one folder per project, rename, delete keeps projects")
         model.startLongVideoToShort()
         precondition(model.screen == .importSource && model.projectURL == nil && model.shortsSource == nil,
                      "Starting upload must not create an empty project or show previous footage")

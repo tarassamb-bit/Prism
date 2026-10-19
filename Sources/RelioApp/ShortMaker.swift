@@ -31,7 +31,7 @@ enum CaptionGenerationIssue {
     var message: String {
         switch self {
         case .permissionDenied:
-            "Enable Speech Recognition for Relio in System Settings, then try again."
+            "Enable Speech Recognition for Prism in System Settings, then try again."
         case .permissionRestricted:
             "Speech Recognition is restricted on this Mac."
         case .unavailableOnDevice:
@@ -136,6 +136,9 @@ enum ShortMaker {
         excluding: [SourceInterval] = [],
         transcriptionEnabled: Bool = true,
         gemini: GeminiConfiguration? = nil,
+        videoType: VideoType = .general,
+        cachedTranscript: SentenceTranscript? = nil,
+        onTranscript: @escaping @Sendable (SentenceTranscript) -> Void = { _ in },
         progress: @escaping @Sendable (Int, Int) -> Void = { _, _ in },
         generationProgress: @escaping @Sendable (Double, String) -> Void = { _, _ in }
     ) async throws -> [ShortResult] {
@@ -156,10 +159,17 @@ enum ShortMaker {
         generationProgress(gemini == nil ? 0.4 : 0, gemini == nil ? "Transcribing speech" : "Preparing audio for Gemini")
         let transcription: CaptionGenerationResult
         if let gemini, hasAudio, transcriptionEnabled {
-            let sentences = try await GeminiSelection.transcribeSentences(url: url, interval: interval, configuration: gemini, progress: { fraction in
-                generationProgress(0.55 * fraction, "Gemini · transcribing audio · \(Int(fraction * 100))%")
-            })
-            transcription = .init(cues: sentences, issue: nil, words: [])
+            if let saved = cachedTranscript?.cues(covering: interval) {
+                // Saved by an earlier run on this video: no audio upload and no transcription cost.
+                generationProgress(0.55, "Using the saved transcript")
+                transcription = .init(cues: saved, issue: nil, words: [])
+            } else {
+                let sentences = try await GeminiSelection.transcribeSentences(url: url, interval: interval, configuration: gemini, progress: { fraction in
+                    generationProgress(0.55 * fraction, "Gemini · transcribing audio · \(Int(fraction * 100))%")
+                })
+                onTranscript(SentenceTranscript(start: interval.start, end: interval.end, cues: sentences))
+                transcription = .init(cues: sentences, issue: nil, words: [])
+            }
         } else if hasAudio && transcriptionEnabled {
             transcription = await transcribe(url, interval: interval, progress: { fraction in
                 generationProgress(0.4 + 0.15 * fraction, "Transcribing speech · \(Int(fraction * 100))%")
@@ -169,6 +179,17 @@ enum ShortMaker {
         }
         generationProgress(0.55, "Selecting distinct moments")
         let transcript = transcription.cues
+        var videoType = videoType
+        if videoType == .auto {
+            if let gemini, !transcript.isEmpty {
+                generationProgress(0.55, "Gemini · recognizing the kind of video")
+                videoType = await GeminiSelection.detectVideoType(cues: transcript, configuration: gemini)
+                generationProgress(0.55, "Gemini · \(videoType.title)")
+            } else {
+                // Detection needs the cloud transcript; on-device runs keep the general behavior.
+                videoType = .general
+            }
+        }
         let scanStep = max(sampleStep, min(5.0, clipDuration / 8))
         var candidateStarts = stride(from: interval.start, through: latestStart, by: scanStep).map { $0 }
         candidateStarts += transcript.map { min(latestStart, max(interval.start, $0.start)) }
@@ -252,18 +273,27 @@ enum ShortMaker {
         if let gemini {
             generationProgress(0.55, "Gemini · choosing complete stories and layouts")
             let clips = try await GeminiSelection.select(url: url, cues: transcript, interval: interval,
-                                                        targetDuration: clipDuration, count: targetCount, configuration: gemini, excluding: excluding, progress: { fraction, stage in
+                                                        targetDuration: clipDuration, count: targetCount, configuration: gemini, excluding: excluding,
+                                                        guidance: videoType.selectionGuidance, progress: { fraction, stage in
                                                             generationProgress(0.55 + 0.15 * fraction, stage)
                                                         })
             planned = clips.map { (start: $0.start, duration: $0.end - $0.start, fit: $0.layout == "fit", title: $0.title, reason: $0.reason) }
         }
+        // Screens and gameplay lose their edges in a vertical crop, whatever the picker suggested.
+        if videoType.forcesFit { planned = planned.map { ($0.start, $0.duration, true, $0.title, $0.reason) } }
         var results: [ShortResult] = []
         var wordAlignmentAvailable = true
         let sentenceTimingNote = GeminiSelection.sentenceTimingNotice
         for candidate in planned {
             try Task.checkCancellation()
-            let snapped = TranscriptSelection.phraseRange(start: candidate.start, duration: candidate.duration,
-                                                         cues: transcript, interval: interval)
+            let phraseCut = TranscriptSelection.phraseRange(start: candidate.start, duration: candidate.duration,
+                                                           cues: transcript, interval: interval)
+            // Cloud cues are whole sentences, so a Short never starts or stops in the middle of one.
+            let whole = gemini == nil ? phraseCut : TranscriptSelection.completeSentences(
+                start: phraseCut.start, duration: phraseCut.duration, cues: transcript, interval: interval,
+                minDuration: max(1, clipDuration * 0.65), maxDuration: min(90, clipDuration * 1.5))
+            let snapped = TranscriptSelection.trimmedFiller(start: whole.start, duration: whole.duration, cues: transcript,
+                                                            minDuration: max(1, clipDuration * 0.65))
             let phrase = gemini != nil ? TranscriptSelection.paddedPhraseRange(start: snapped.start, duration: snapped.duration,
                                                                                cues: transcript, interval: interval) : snapped
             let referenceCues = transcript.filter { cue in
@@ -433,6 +463,28 @@ enum ShortMaker {
         }
         guard safeEnd > safeStart else { return (start, duration) }
         return (safeStart, safeEnd - safeStart)
+    }
+
+    /// Moves a chosen range's cuts onto whole words and returns that range's words and caption groups,
+    /// both relative to the new start. Nil when no word falls inside it.
+    static func snappedToWords(start: Double, duration: Double, words absolute: [TimedSpeechWord], sourceDuration: Double)
+        -> (start: Double, duration: Double, cues: [TimedCaption], words: [TimedSpeechWord])? {
+        let range = speechSafeRange(start: start, duration: duration, words: absolute, interval: (0, sourceDuration))
+        let inside = absolute.filter { $0.start >= range.start - 0.01 && $0.start + $0.duration <= range.start + range.duration + 0.01 }
+        guard !inside.isEmpty else { return nil }
+        let words = inside.map { TimedSpeechWord(text: $0.text, start: $0.start - range.start, duration: $0.duration) }
+        return (range.start, range.duration, captionGroups(words), words)
+    }
+
+    /// Measures word timing on this Mac for a Short Gemini already chose, then snaps its cuts to whole words.
+    /// A little speech on each side is transcribed too, so a word cut by either edge is seen in full.
+    static func retimedOnDevice(url: URL, start: Double, duration: Double, sourceDuration: Double, languageHint: String?) async
+        -> (start: Double, duration: Double, cues: [TimedCaption], words: [TimedSpeechWord])? {
+        let windowStart = max(0, start - 1.5)
+        let windowEnd = min(sourceDuration, start + duration + 1.5)
+        let local = await captions(for: url, start: windowStart, duration: windowEnd - windowStart, languageHint: languageHint)
+        let absolute = local.words.map { TimedSpeechWord(text: $0.text, start: $0.start + windowStart, duration: $0.duration) }
+        return snappedToWords(start: start, duration: duration, words: absolute, sourceDuration: sourceDuration)
     }
 
     static func analyzeSubjectPath(_ url: URL, start: Double, duration: Double, zoom: Double = 1.08, useSemanticModel: Bool = true) async -> [CropKeyframe] {
@@ -617,7 +669,9 @@ enum ShortMaker {
         session.videoComposition = videoComposition
         session.outputURL = temporary
         session.outputFileType = .mp4
-        await session.export()
+        nonisolated(unsafe) let running = session
+        await withTaskCancellationHandler { await running.export() } onCancel: { running.cancelExport() }
+        try Task.checkCancellation()
         if session.status != .completed { throw session.error ?? Failure.cannotExport }
         try FileManager.default.moveItem(at: temporary, to: destination)
     }
@@ -658,15 +712,24 @@ enum ShortMaker {
         let oriented = CGSize(width: abs(transformed.width), height: abs(transformed.height))
         let target = CGSize(width: 1080, height: 1920)
         guard oriented.width > 0, oriented.height > 0 else { throw Failure.noVideo }
-        let usesBlurredFitBackground = segment.fitToFrame == true && oriented.width / oriented.height > target.width / target.height
-        if usesBlurredFitBackground && !live {
-            // The blurred background depends only on the source range, so caption and style edits reuse it.
-            let cached = renderCacheURL("fit-v2|\(source.path)|\(segment.start)|\(segment.duration)", prefix: "fit")
+        let isSplit = segment.splitScreen == true
+        let usesBlurredFitBackground = !isSplit && segment.fitToFrame == true && oriented.width / oriented.height > target.width / target.height
+        // Split and blurred Fit frames are drawn with Core Image instead of a layer transform.
+        let drawsFrames = isSplit || usesBlurredFitBackground
+        let draw: @Sendable (CIImage) -> CIImage
+        let centers = segment.splitCenters ?? []
+        if isSplit { draw = { image in ShortMaker.splitScreenFrame(image, transform: preferred, centers: centers) } }
+        else { draw = { image in ShortMaker.blurredFitFrame(image, transform: preferred) } }
+        if drawsFrames && !live {
+            // The drawn picture depends only on the layout and source range, so caption and style edits reuse it.
+            let cached = isSplit
+                ? renderCacheURL("split-v2|\(source.path)|\(segment.start)|\(segment.duration)|\(centers)", prefix: "split")
+                : renderCacheURL("fit-v2|\(source.path)|\(segment.start)|\(segment.duration)", prefix: "fit")
             if !FileManager.default.fileExists(atPath: cached.path) {
                 try FileManager.default.createDirectory(at: renderCacheDirectory, withIntermediateDirectories: true)
                 let intermediate = renderCacheDirectory.appendingPathComponent(".relio-fit-\(UUID()).mp4")
                 defer { try? FileManager.default.removeItem(at: intermediate) }
-                try await renderBlurredFitVideo(asset: asset, track: videoTrack, range: range, transform: preferred, outputURL: intermediate)
+                try await renderFrames(asset: asset, track: videoTrack, range: range, outputURL: intermediate, draw: draw)
                 try? FileManager.default.moveItem(at: intermediate, to: cached) // fails only if a parallel render stored it first
                 pruneRenderCache()
             }
@@ -684,7 +747,7 @@ enum ShortMaker {
         let instruction = AVMutableVideoCompositionInstruction()
         instruction.timeRange = CMTimeRange(start: .zero, duration: CMTime(seconds: segment.duration, preferredTimescale: 600))
         let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: composedVideo)
-        let panDistance = segment.fitToFrame == true || oriented.width / oriented.height < 1.2
+        let panDistance = drawsFrames || segment.fitToFrame == true || oriented.width / oriented.height < 1.2
             ? 0 : max(0, oriented.width * scale - target.width)
         if panDistance > 2 {
             if let trackedPath = segment.cropKeyframes {
@@ -725,16 +788,16 @@ enum ShortMaker {
                 layer.setTransform(baseTransform.concatenating(CGAffineTransform(translationX: offset, y: 0)), at: .zero)
             }
         } else {
-            layer.setTransform(usesBlurredFitBackground ? .identity : baseTransform, at: .zero)
+            layer.setTransform(drawsFrames ? .identity : baseTransform, at: .zero)
         }
         let videoComposition = AVMutableVideoComposition()
         instruction.layerInstructions = [layer]
         videoComposition.instructions = [instruction]
         videoComposition.renderSize = target
         videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
-        if usesBlurredFitBackground && live {
+        if drawsFrames && live {
             let fit = AVMutableVideoComposition(asset: composition) { request in
-                request.finish(with: blurredFitFrame(request.sourceImage, transform: preferred), context: nil)
+                request.finish(with: draw(request.sourceImage), context: nil)
             }
             fit.renderSize = target
             fit.frameDuration = videoComposition.frameDuration
@@ -748,21 +811,48 @@ enum ShortMaker {
         guard !(segment.captions ?? []).isEmpty || !segment.caption.isEmpty else { return nil }
         let parent = CALayer(); parent.frame = CGRect(x: 0, y: 0, width: 1080, height: 1920)
         let captions = segment.captions ?? []
-        let overlayY: CGFloat = captions.isEmpty ? 220 : 1450
-        // Highlights need real word timings; estimated timings would highlight the wrong word.
-        let timedWords = segment.captionStyle == .viral ? (segment.speechWords ?? []) : []
+        let position = segment.captionPosition ?? .bottom
+        let y = position.y
+        let scale = (segment.captionSize ?? .medium).scale
+        let pops = segment.captionAnimated == true
+        // The on-screen text overlay moves out of the subtitles' way.
+        let overlayY: CGFloat = captions.isEmpty ? 220 : position == .top ? 330 : 1450
+        let style = (segment.captionStyle ?? .classic).resolved
+        // Word-following styles need real word timings; estimated timings would mark the wrong word.
+        let timedWords = style.usesWordTiming || style == .boldCaps ? (segment.speechWords ?? []) : []
         for cue in captions {
             let cueWords = timedWords.filter {
                 $0.start >= cue.start - 0.02 && $0.start + $0.duration <= cue.start + cue.duration + 0.02
             }.sorted { $0.start < $1.start }
-            if !cueWords.isEmpty, normalizedCaptionWords(cueWords.map(\.text)) == normalizedCaptionWords([cue.text]) {
-                for (index, word) in cueWords.enumerated() {
-                    let end = index + 1 < cueWords.count ? cueWords[index + 1].start : cue.start + cue.duration
-                    addCaption(cue.text, start: word.start, duration: max(0.01, end - word.start),
-                               total: segment.duration, y: 330, highlightedWord: index, to: parent)
+            guard !cueWords.isEmpty, normalizedCaptionWords(cueWords.map(\.text)) == normalizedCaptionWords([cue.text]) else {
+                addCaption(cue.text, start: cue.start, duration: cue.duration, total: segment.duration, y: y, style: style,
+                           scale: scale, pops: pops, to: parent)
+                continue
+            }
+            func end(of index: Int) -> Double { index + 1 < cueWords.count ? cueWords[index + 1].start : cue.start + cue.duration }
+            switch style {
+            case .boldCaps:
+                for first in stride(from: 0, to: cueWords.count, by: 3) {
+                    let group = cueWords[first..<min(first + 3, cueWords.count)]
+                    addCaption(group.map(\.text).joined(separator: " "), start: group.first!.start,
+                               duration: max(0.01, end(of: group.endIndex - 1) - group.first!.start),
+                               total: segment.duration, y: y, style: style, scale: scale, pops: pops, to: parent)
                 }
-            } else {
-                addCaption(cue.text, start: cue.start, duration: cue.duration, total: segment.duration, y: 330, to: parent)
+            case .oneWord:
+                for (index, word) in cueWords.enumerated() {
+                    addCaption(word.text, start: word.start, duration: max(0.01, end(of: index) - word.start),
+                               total: segment.duration, y: y, style: style, scale: scale, pops: pops, to: parent)
+                }
+            case .viral, .highlightBox, .podcast:
+                for (index, word) in cueWords.enumerated() {
+                    // Only a new line pops; a moving highlight inside the same line must not bounce on every word.
+                    addCaption(cue.text, start: word.start, duration: max(0.01, end(of: index) - word.start),
+                               total: segment.duration, y: y, highlightedWord: index, style: style,
+                               scale: scale, pops: pops && index == 0, to: parent)
+                }
+            default:
+                addCaption(cue.text, start: cue.start, duration: cue.duration, total: segment.duration, y: y, style: style,
+                           scale: scale, pops: pops, to: parent)
             }
         }
         if !segment.caption.isEmpty {
@@ -804,8 +894,66 @@ enum ShortMaker {
         return foreground.composited(over: background).cropped(to: canvas)
     }
 
-    private static func renderBlurredFitVideo(asset: AVAsset, track: AVAssetTrack, range: CMTimeRange,
-                                             transform: CGAffineTransform, outputURL: URL) async throws {
+    /// Face centers from sampled frames → the two speakers' horizontal centers, left first; nil unless two clear groups exist.
+    static func splitCenters(fromFaceXs xs: [Double]) -> [Double]? {
+        let sorted = xs.filter { $0.isFinite && (0...1).contains($0) }.sorted()
+        guard sorted.count >= 2 else { return nil }
+        let gaps = zip(sorted, sorted.dropFirst()).enumerated().map { ($0.offset, $0.element.1 - $0.element.0) }
+        guard let widest = gaps.max(by: { $0.1 < $1.1 }), widest.1 >= 0.15 else { return nil }
+        let left = sorted[...widest.0], right = sorted[(widest.0 + 1)...]
+        return [left.reduce(0, +) / Double(left.count), right.reduce(0, +) / Double(right.count)]
+    }
+
+    /// Looks for two people across a Short and returns where each sits, left first.
+    static func findSplitCenters(_ url: URL, start: Double, duration: Double) async -> [Double]? {
+        await Task.detached(priority: .utility) { () -> [Double]? in
+            let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+            generator.appliesPreferredTrackTransform = true
+            generator.maximumSize = CGSize(width: 640, height: 640)
+            var xs: [Double] = []
+            for index in 0..<8 {
+                let time = start + duration * (Double(index) + 0.5) / 8
+                guard let image = try? generator.copyCGImage(at: CMTime(seconds: time, preferredTimescale: 600), actualTime: nil) else { continue }
+                let faces = VNDetectFaceRectanglesRequest()
+                try? VNImageRequestHandler(cgImage: image).perform([faces])
+                xs += (faces.results ?? []).filter { $0.confidence > 0.5 }.map { Double($0.boundingBox.midX) }
+            }
+            return splitCenters(fromFaceXs: xs)
+        }.value
+    }
+
+    /// One split-screen frame at 1080×1920: the left speaker fills the top, the right speaker the bottom.
+    /// Each panel shows a half-width window centered on its speaker (`centers`), or on the left/right quarter.
+    static func splitScreenFrame(_ source: CIImage, transform: CGAffineTransform, centers: [Double] = []) -> CIImage {
+        let canvas = CGRect(x: 0, y: 0, width: 1080, height: 1920)
+        let bounds = CGRect(origin: .zero, size: source.extent.size).applying(transform)
+        let oriented = source.transformed(by: transform)
+            .transformed(by: CGAffineTransform(translationX: -bounds.minX, y: -bounds.minY))
+        let half = CGSize(width: bounds.width / 2, height: bounds.height)
+        let panel = CGSize(width: 1080, height: 960)
+        let scale = max(panel.width / half.width, panel.height / half.height)
+        // Core Image's origin is bottom-left, so the top panel starts at y 960.
+        func windowX(_ center: Double) -> CGFloat {
+            min(bounds.width - half.width, max(0, CGFloat(center) * bounds.width - half.width / 2))
+        }
+        func place(fromX x: CGFloat, atY y: CGFloat) -> CIImage {
+            oriented.cropped(to: CGRect(x: x, y: 0, width: half.width, height: half.height))
+                .transformed(by: CGAffineTransform(translationX: -x, y: 0))
+                .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+                .transformed(by: CGAffineTransform(translationX: (panel.width - half.width * scale) / 2,
+                                                   y: y + (panel.height - half.height * scale) / 2))
+                .cropped(to: CGRect(x: 0, y: y, width: panel.width, height: panel.height))
+        }
+        let top = centers.count == 2 ? windowX(centers[0]) : 0
+        let bottom = centers.count == 2 ? windowX(centers[1]) : half.width
+        return place(fromX: top, atY: 960)
+            .composited(over: place(fromX: bottom, atY: 0))
+            .composited(over: CIImage(color: .black).cropped(to: canvas))
+            .cropped(to: canvas)
+    }
+
+    private static func renderFrames(asset: AVAsset, track: AVAssetTrack, range: CMTimeRange,
+                                     outputURL: URL, draw: (CIImage) -> CIImage) async throws {
         let renderSize = CGSize(width: 1080, height: 1920)
         let reader = try AVAssetReader(asset: asset)
         reader.timeRange = range
@@ -863,7 +1011,7 @@ enum ShortMaker {
             guard allocation == kCVReturnSuccess, let destinationBuffer else {
                 reader.cancelReading(); writer.cancelWriting(); throw Failure.cannotExport
             }
-            ciContext.render(blurredFitFrame(CIImage(cvPixelBuffer: sourceBuffer), transform: transform), to: destinationBuffer,
+            ciContext.render(draw(CIImage(cvPixelBuffer: sourceBuffer)), to: destinationBuffer,
                              bounds: canvas, colorSpace: CGColorSpaceCreateDeviceRGB())
             let sourceTime = CMSampleBufferGetPresentationTimeStamp(sample)
             let outputTime = CMTimeSubtract(sourceTime, range.start)
@@ -881,11 +1029,12 @@ enum ShortMaker {
     }
 
     private static func addCaption(_ text: String, start: Double, duration: Double, total: Double, y: CGFloat,
-                                   highlightedWord: Int? = nil, to parent: CALayer) {
+                                   highlightedWord: Int? = nil, style: CaptionStyle = .classic, scale: CGFloat = 1,
+                                   pops: Bool = false, to parent: CALayer) {
         guard start.isFinite, duration.isFinite, total > 0, start < total, duration > 0,
-              let image = captionImage(text, highlightedWord: highlightedWord) else { return }
+              let image = captionImage(text, highlightedWord: highlightedWord, style: style, scale: scale) else { return }
         let captionLayer = CALayer()
-        captionLayer.frame = CGRect(x: 70, y: y, width: 940, height: 210)
+        captionLayer.frame = CGRect(x: 70, y: y, width: 940, height: CGFloat(image.height))
         captionLayer.contents = image
         let overlayStart = max(0, min(start, total))
         let overlayDuration = min(duration, total - overlayStart)
@@ -899,35 +1048,117 @@ enum ShortMaker {
         visibility.fillMode = .both
         visibility.isRemovedOnCompletion = false
         captionLayer.add(visibility, forKey: "captionVisibility")
+        if pops {
+            let pop = CAKeyframeAnimation(keyPath: "transform.scale")
+            pop.values = [0.8, 1.08, 1]
+            pop.keyTimes = [0, 0.6, 1]
+            pop.duration = min(0.2, overlayDuration)
+            // Zero means "now" to Core Animation; video timelines need the AVFoundation constant instead.
+            pop.beginTime = overlayStart > 0 ? overlayStart : AVCoreAnimationBeginTimeAtZero
+            pop.fillMode = .both
+            pop.isRemovedOnCompletion = false
+            captionLayer.add(pop, forKey: "captionPop")
+        }
         parent.addSublayer(captionLayer)
     }
 
-    /// Simple captions: white text with a black outline. Viral captions add a yellow spoken word.
-    private static func captionImage(_ text: String, highlightedWord: Int? = nil) -> CGImage? {
-        // Draw at exactly the 940×210 pixels export uses; NSImage focus would render 2× on Retina and scale down.
-        guard let context = CGContext(data: nil, width: 940, height: 210, bitsPerComponent: 8, bytesPerRow: 0,
+    /// A sample of each subtitle style, drawn by the same code as exported captions so the picker matches the video.
+    static func captionPreview(_ style: CaptionStyle) -> CGImage? {
+        let image: CGImage? = switch style.resolved {
+        case .oneWord: captionImage("Hello", style: style)
+        case .viral, .highlightBox, .podcast: captionImage("Hello everyone", highlightedWord: 0, style: style)
+        default: captionImage("Hello everyone", style: style)
+        }
+        return image.flatMap { trimmedToContent($0, padding: 14) } ?? image
+    }
+
+    /// Crops away the transparent margin so a small preview shows the text large.
+    private static func trimmedToContent(_ image: CGImage, padding: Int) -> CGImage? {
+        let width = image.width, height = image.height
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        guard let context = CGContext(data: &pixels, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4,
+                                      space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        var minX = width, minY = height, maxX = -1, maxY = -1
+        for y in 0..<height {
+            for x in 0..<width where pixels[(y * width + x) * 4 + 3] > 8 {
+                minX = min(minX, x); maxX = max(maxX, x); minY = min(minY, y); maxY = max(maxY, y)
+            }
+        }
+        guard maxX >= minX, maxY >= minY else { return nil }
+        // The buffer's rows run top-down, which matches CGImage cropping.
+        let box = CGRect(x: max(0, minX - padding), y: max(0, minY - padding),
+                         width: min(width, maxX + padding + 1) - max(0, minX - padding),
+                         height: min(height, maxY + padding + 1) - max(0, minY - padding))
+        return image.cropping(to: box)
+    }
+
+    /// One caption image, 940 px wide, for any subtitle style. `highlightedWord` marks the spoken word.
+    private static func captionImage(_ text: String, highlightedWord: Int? = nil, style: CaptionStyle = .classic, scale k: CGFloat = 1) -> CGImage? {
+        let style = style.resolved
+        let height = Int(((style == .boldCaps ? 300 : 210) * k).rounded())
+        // Draw at exactly the pixels export uses; NSImage focus would render 2× on Retina and scale down.
+        guard let context = CGContext(data: nil, width: 940, height: height, bitsPerComponent: 8, bytesPerRow: 0,
                                       space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
         NSGraphicsContext.saveGraphicsState()
         defer { NSGraphicsContext.restoreGraphicsState() }
         NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
         let paragraph = NSMutableParagraphStyle()
         paragraph.alignment = .center
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 66, weight: .heavy),
-            .foregroundColor: NSColor.white,
-            .paragraphStyle: paragraph,
-            .strokeColor: NSColor.black,
-            .strokeWidth: -3
-        ]
-        let styled = NSMutableAttributedString(string: text, attributes: attributes)
-        if let highlightedWord {
-            let expression = try? NSRegularExpression(pattern: "\\S+")
-            let ranges = expression?.matches(in: text, range: NSRange(location: 0, length: (text as NSString).length)) ?? []
-            if ranges.indices.contains(highlightedWord) {
-                styled.addAttribute(.foregroundColor, value: NSColor.yellow, range: ranges[highlightedWord].range)
-            }
+        let bounds = NSRect(x: 24, y: 30 * k, width: 892, height: CGFloat(height) - 45 * k)
+        let shown = style == .boldCaps ? text.uppercased() : text
+        let highlight: NSRange? = highlightedWord.flatMap { index in
+            let ranges = (try? NSRegularExpression(pattern: "\\S+"))?.matches(in: shown, range: NSRange(location: 0, length: (shown as NSString).length)) ?? []
+            return ranges.indices.contains(index) ? ranges[index].range : nil
         }
-        styled.draw(in: NSRect(x: 24, y: 30, width: 892, height: 165))
+
+        switch style {
+        case .minimal:
+            // Calm text on a soft dark band sized to the words.
+            let words = NSAttributedString(string: shown, attributes: [.font: NSFont.systemFont(ofSize: 46 * k, weight: .semibold),
+                                                                       .foregroundColor: NSColor.white, .paragraphStyle: paragraph])
+            let size = words.boundingRect(with: NSSize(width: bounds.width - 48 * k, height: bounds.height),
+                                          options: [.usesLineFragmentOrigin, .usesFontLeading]).size
+            let textWidth = ceil(size.width) + 2, textHeight = ceil(size.height)
+            let band = NSRect(x: bounds.midX - textWidth / 2 - 24 * k, y: bounds.maxY - textHeight - 20 * k,
+                              width: textWidth + 48 * k, height: textHeight + 20 * k)
+            NSColor.black.withAlphaComponent(0.62).setFill()
+            NSBezierPath(roundedRect: band, xRadius: 18 * k, yRadius: 18 * k).fill()
+            words.draw(in: NSRect(x: band.minX + 24 * k, y: band.minY + 10 * k, width: textWidth, height: textHeight))
+        case .podcast:
+            // White text with a soft shadow; the spoken word in green.
+            let shadow = NSShadow()
+            shadow.shadowColor = NSColor.black.withAlphaComponent(0.85)
+            shadow.shadowBlurRadius = 10 * k
+            shadow.shadowOffset = NSSize(width: 0, height: -2 * k)
+            let words = NSMutableAttributedString(string: shown, attributes: [.font: NSFont.systemFont(ofSize: 56 * k, weight: .bold),
+                                                                              .foregroundColor: NSColor.white, .paragraphStyle: paragraph, .shadow: shadow])
+            if let highlight {
+                words.addAttribute(.foregroundColor, value: NSColor(srgbRed: 0.22, green: 0.89, blue: 0.49, alpha: 1), range: highlight)
+            }
+            words.draw(in: bounds)
+        default:
+            // Simple, Viral, Highlight box, Bold caps and One word: heavy white text with a black outline.
+            let size: CGFloat = (style == .oneWord ? 104 : style == .boldCaps ? 76 : 66) * k
+            let radius: CGFloat = (style == .oneWord ? 5 : style == .boldCaps ? 4 : 3) * k
+            let font = NSFont.systemFont(ofSize: size, weight: .heavy)
+            // The outline is the text repeated in black around the edge. A stroke instead would cut into the
+            // counters of letters such as e and a, leaving stray lines inside them.
+            let outline = NSAttributedString(string: shown, attributes: [.font: font, .foregroundColor: NSColor.black, .paragraphStyle: paragraph])
+            for step in 0..<16 {
+                let angle = CGFloat(step) * .pi / 8
+                outline.draw(in: bounds.offsetBy(dx: cos(angle) * radius, dy: sin(angle) * radius))
+            }
+            let fill = NSMutableAttributedString(string: shown, attributes: [.font: font, .foregroundColor: NSColor.white, .paragraphStyle: paragraph])
+            if let highlight {
+                if style == .highlightBox {
+                    fill.addAttributes([.backgroundColor: NSColor.yellow, .foregroundColor: NSColor.black], range: highlight)
+                } else {
+                    fill.addAttribute(.foregroundColor, value: NSColor.yellow, range: highlight)
+                }
+            }
+            fill.draw(in: bounds)
+        }
         return context.makeImage()
     }
 

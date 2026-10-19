@@ -182,6 +182,73 @@ import AppKit
         precondition(english?.language.languageCode?.identifier == "en" && spanish?.language.languageCode?.identifier == "es",
                      "Word timing must use the caption language, not only the Mac's language: \(String(describing: english)) \(String(describing: spanish))")
         print("PASS on-device word timing picks the recognizer language from caption text")
+        // Regression: Gemini ended a Short at 168.6 s while the on-device timing has "tank." finishing at 168.95 s.
+        // Re-timing must move the cut past that word instead of leaving the Short ending on "in the".
+        let spoken = [("It", 129.2, 0.4), ("turns", 129.7, 0.3), ("less", 166.0, 0.2), ("oil", 166.3, 0.2), ("is", 167.2, 0.15),
+                      ("present", 167.7, 0.5), ("in", 168.2, 0.15), ("the", 168.35, 0.15), ("tank.", 168.5, 0.45)]
+        let words = spoken.map { TimedSpeechWord(text: $0.0, start: $0.1, duration: $0.2) }
+        let snapped = ShortMaker.snappedToWords(start: 129.5, duration: 39.1, words: words, sourceDuration: 700)
+        precondition(snapped != nil && snapped!.words.last?.text == "tank." && snapped!.start + snapped!.duration >= 168.95,
+                     "Re-timed Shorts must not end in the middle of a word: \(String(describing: snapped))")
+        precondition(snapped!.start < 129.5 && snapped!.words.first?.text == "It", "A start inside a word must move to the word's beginning")
+        precondition(snapped!.cues.last?.text.hasSuffix("tank.") == true, "Caption groups must be rebuilt from the snapped words")
+        precondition(ShortMaker.snappedToWords(start: 10, duration: 5, words: [], sourceDuration: 100) == nil, "No words, no re-timing")
+        print("PASS on-device re-timing moves cuts onto whole words, so a Short no longer ends mid-word")
+        // Every subtitle style renders. Word-following styles change with each word, Bold caps shows three words at a time,
+        // and without word timing every style falls back to one whole phrase per caption.
+        for style in CaptionStyle.allCases {
+            precondition(ShortMaker.captionPreview(style) != nil, "\(style.title) preview must render")
+            let layer = ShortMaker.captionLayer(for: EditSegment(mediaID: imported.id, duration: 3, captions: [viralCue],
+                                                                 speechWords: viralWords, captionStyle: style))
+            let expected = style == .boldCaps ? 2 : style.usesWordTiming ? viralWords.count : 1
+            precondition(layer?.sublayers?.count == expected, "\(style.title) must make \(expected) caption layers, made \(layer?.sublayers?.count ?? 0)")
+            let untimed = ShortMaker.captionLayer(for: EditSegment(mediaID: imported.id, duration: 3, captions: [viralCue], captionStyle: style))
+            precondition(untimed?.sublayers?.count == 1, "\(style.title) without word timing must show the whole phrase")
+        }
+        let boxURL = root.appendingPathComponent("highlight-box.mp4")
+        try await ShortMaker.export(source: source, segment: EditSegment(mediaID: imported.id, duration: 3,
+            captions: [viralCue], speechWords: viralWords, captionStyle: .highlightBox), destination: boxURL)
+        let (boxPixels, _) = try yellowPixels(boxURL)
+        precondition(boxPixels > highlightPixels * 2, "Highlight box must fill a yellow box behind the word, not only color its letters")
+        precondition(VideoType.tutorial.forcesFit && VideoType.gaming.forcesFit && !VideoType.podcast.forcesFit && !VideoType.vlog.forcesFit)
+        precondition(VideoType.general.selectionGuidance.isEmpty && !VideoType.informational.selectionGuidance.isEmpty)
+        // Split screen: the source's left person fills the top half, the right person the bottom half.
+        let twoPeople = CIImage(color: .red).cropped(to: CGRect(x: 0, y: 0, width: 320, height: 360))
+            .composited(over: CIImage(color: .blue).cropped(to: CGRect(x: 320, y: 0, width: 320, height: 360)))
+        let split = ShortMaker.splitScreenFrame(twoPeople, transform: .identity)
+        let splitBitmap = NSBitmapImageRep(ciImage: split)
+        let topColor = splitBitmap.colorAt(x: 540, y: 400)!, bottomColor = splitBitmap.colorAt(x: 540, y: 1500)!
+        precondition(split.extent == CGRect(x: 0, y: 0, width: 1080, height: 1920)
+                     && topColor.redComponent > 0.9 && topColor.blueComponent < 0.1
+                     && bottomColor.blueComponent > 0.9 && bottomColor.redComponent < 0.1,
+                     "Split screen must put the left person on top and the right person on the bottom")
+        precondition(ShortMaker.splitCenters(fromFaceXs: [0.31, 0.7, 0.29, 0.72, 0.3]) == [0.3, 0.71]
+                     && ShortMaker.splitCenters(fromFaceXs: [0.48, 0.5, 0.52]) == nil
+                     && ShortMaker.splitCenters(fromFaceXs: [0.4]) == nil,
+                     "Two face groups give two speaker centers; one group or one face gives none")
+        let shifted = NSBitmapImageRep(ciImage: ShortMaker.splitScreenFrame(twoPeople, transform: .identity, centers: [0.5, 0.5]))
+        let shiftedTop = shifted.colorAt(x: 100, y: 400)!, shiftedTopRight = shifted.colorAt(x: 980, y: 400)!
+        precondition(shiftedTop.redComponent > 0.9 && shiftedTopRight.blueComponent > 0.9,
+                     "A centered speaker must pull the panel's window onto the middle of the source")
+        print("PASS split screen layout and speaker centers")
+        // Position moves the subtitles, size draws them larger, and only animated Shorts pop in.
+        let bottomLayer = ShortMaker.captionLayer(for: EditSegment(mediaID: imported.id, duration: 3, captions: [viralCue], captionStyle: .classic))?.sublayers?.first
+        var topLarge = EditSegment(mediaID: imported.id, duration: 3, captions: [viralCue], captionStyle: .boldCaps)
+        topLarge.captionPosition = .top; topLarge.captionSize = .large; topLarge.captionAnimated = true
+        let topLayer = ShortMaker.captionLayer(for: topLarge)?.sublayers?.first
+        precondition(bottomLayer?.frame.minY == 330 && topLayer?.frame.minY == 1460, "Position must move the subtitles")
+        precondition((topLayer?.frame.height ?? 0) > (bottomLayer?.frame.height ?? 0) && (topLayer?.frame.maxY ?? 9999) <= 1920,
+                     "Large subtitles must be drawn larger and still fit inside the frame")
+        precondition(topLayer?.animation(forKey: "captionPop") != nil && bottomLayer?.animation(forKey: "captionPop") == nil,
+                     "Only Shorts with pop-in turned on animate")
+        var viralPop = EditSegment(mediaID: imported.id, duration: 3, captions: [viralCue], speechWords: viralWords, captionStyle: .viral)
+        viralPop.captionAnimated = true
+        let popping = ShortMaker.captionLayer(for: viralPop)?.sublayers?.filter { $0.animation(forKey: "captionPop") != nil }.count
+        precondition(popping == 1, "A moving highlight must not bounce the line on every word")
+        let placedURL = root.appendingPathComponent("top-large-pop.mp4")
+        try await ShortMaker.export(source: source, segment: topLarge, destination: placedURL)
+        precondition(FileManager.default.fileExists(atPath: placedURL.path), "A Short with moved, larger, animated subtitles must export")
+        print("PASS all \(CaptionStyle.allCases.count) subtitle styles render, follow words or fall back to phrases; video types set layout and style")
         func captionArea(_ url: URL, _ seconds: Double) throws -> [UInt8] {
             let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
             generator.requestedTimeToleranceBefore = .zero

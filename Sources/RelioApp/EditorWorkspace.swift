@@ -15,15 +15,20 @@ extension ContentView {
         HStack(spacing: 18) {
             Button { model.player?.pause(); model.screen = .home } label: {
                 Label("Home", systemImage: "chevron.left")
-            }.buttonStyle(.plain).help("Back to projects").disabled(model.isBusy)
+            }.buttonStyle(.prismLink).help("Back to projects").disabled(model.isBusy)
             Rectangle().fill(EditorStyle.line).frame(width: 1, height: 20)
             PrismMark().frame(height: 20)
             Text("Prism").font(Prism.display(20)).tracking(-0.4)
             VStack(alignment: .leading, spacing: 2) {
                 Text(model.project?.displayTitle ?? "Untitled project").font(Prism.text(12, .medium)).lineLimit(1)
-                Text("Step 4 · Review and export").font(Prism.text(10)).foregroundStyle(Prism.textSecondary)
+                Text("Step 5 · Review and export").font(Prism.text(11)).foregroundStyle(Prism.textSecondary)
             }
             Spacer(minLength: 12)
+            if let saved = model.lastSavedAt {
+                Label("Saved \(saved.formatted(date: .omitted, time: .shortened))", systemImage: "checkmark.circle")
+                    .font(Prism.text(11)).foregroundStyle(Prism.textSecondary).lineLimit(1)
+                    .help("Prism saves every change to this project automatically")
+            }
             if model.isBusy { ProgressView().controlSize(.small) }
             Label(model.isBusy ? model.generationStage : (model.useGemini ? "Gemini cloud" : "On-device AI"),
                   systemImage: model.isBusy ? "clock" : (model.useGemini ? "cloud" : "desktopcomputer"))
@@ -32,12 +37,12 @@ extension ContentView {
                 Label("Exports", systemImage: "folder")
                     .font(Prism.text(11, .medium))
             }
-            .buttonStyle(.plain)
+            .buttonStyle(.prismLink)
             .disabled(model.projectURL == nil || model.isBusy)
             .help(model.exportedFiles.isEmpty ? "Open this project's Exports folder" : "Show the exported video files in Finder")
             AppearanceSwitch(selection: $appearance)
-            Button { model.undoFromEditor() } label: { Image(systemName: "arrow.uturn.backward") }
-                .buttonStyle(.plain).disabled(model.editHistory.isEmpty || model.isBusy).help("Undo edit")
+            Button { model.undoFromEditor() } label: { Image(systemName: "arrow.uturn.backward") }.buttonStyle(.prismIcon)
+                .disabled(model.editHistory.isEmpty || model.isBusy).help("Undo edit · ⌘Z")
                 .accessibilityLabel("Undo edit")
             Button { model.export() } label: {
                 Label("Export", systemImage: "square.and.arrow.up")
@@ -49,6 +54,110 @@ extension ContentView {
         }.padding(.horizontal, 20).frame(height: 54)
             .background(EditorStyle.panel)
             .overlay(alignment: .bottom) { EditorStyle.line.frame(height: 1) }
+    }
+
+    /// Covers the editor while Shorts are made: everything behind is dimmed and blocked; only Cancel works.
+    func generationOverlay(_ progress: Double) -> some View {
+        ZStack {
+            Color.black.opacity(0.55).contentShape(Rectangle()).onTapGesture {}
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Text(model.generationStage).font(Prism.text(14, .medium)).lineLimit(1)
+                    Spacer()
+                    Text("\(Int(progress * 100))%").font(Prism.mono(12)).foregroundStyle(Prism.textSecondary)
+                }
+                PrismProgressLine(value: progress)
+                HStack {
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        Text("Elapsed \(editorTime(context.date.timeIntervalSince(model.generationStartedAt)))")
+                            .font(Prism.mono(11)).foregroundStyle(Prism.textSecondary)
+                    }
+                    Spacer()
+                    Button("Cancel") {
+                        let leaveEditor = !model.isExporting
+                        model.cancelGeneration()
+                        if leaveEditor {
+                            model.player?.pause()
+                            model.screen = .home
+                        }
+                    }
+                    .disabled(model.generationStage == "Cancelling…")
+                    .controlSize(.large)
+                }
+            }
+            .padding(24)
+            .frame(width: 460)
+            .background(EditorStyle.panel, in: RoundedRectangle(cornerRadius: 16))
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(EditorStyle.line))
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Creating Shorts")
+        }
+    }
+
+    func exportDoneOverlay(_ summary: String) -> some View {
+        ZStack {
+            Color.black.opacity(0.55).contentShape(Rectangle()).onTapGesture { model.exportSummary = nil }
+            VStack(alignment: .leading, spacing: 14) {
+                Label("Export finished", systemImage: "checkmark.circle.fill")
+                    .font(Prism.text(16, .medium)).foregroundStyle(Prism.accent)
+                Text(summary).font(Prism.text(13))
+                Text("1080 × 1920 · 30 fps · MP4, ready to upload.").font(Prism.text(12)).foregroundStyle(Prism.textSecondary)
+                HStack {
+                    Button("Done") { model.exportSummary = nil }
+                        .controlSize(.large).keyboardShortcut(.cancelAction)
+                    Spacer()
+                    Button("Show in Finder") {
+                        model.exportSummary = nil
+                        model.revealExports()
+                    }
+                    .buttonStyle(.prismPrimary).keyboardShortcut(.defaultAction)
+                }
+            }
+            .padding(24)
+            .frame(width: 460)
+            .background(EditorStyle.panel, in: RoundedRectangle(cornerRadius: 16))
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(EditorStyle.line))
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Export finished")
+        }
+    }
+
+    func generationErrorOverlay(_ error: String) -> some View {
+        let needsKey = error.contains("no API key is saved")
+        return ZStack {
+            Color.black.opacity(0.55).contentShape(Rectangle()).onTapGesture {}
+            VStack(alignment: .leading, spacing: 14) {
+                Label(needsKey ? "Gemini key needed" : "No Shorts found", systemImage: "exclamationmark.triangle")
+                    .font(Prism.text(16, .medium)).foregroundStyle(Prism.amber)
+                Text(error).font(Prism.text(13)).fixedSize(horizontal: false, vertical: true)
+                if !needsKey {
+                    Text("Change the clip length or which part of the video Prism looks in, then try again.")
+                        .font(Prism.text(12)).foregroundStyle(Prism.textSecondary).fixedSize(horizontal: false, vertical: true)
+                }
+                HStack {
+                    Button("Close") { model.generationError = nil }
+                        .controlSize(.large).keyboardShortcut(.cancelAction)
+                    Spacer()
+                    Button("Try again") {
+                        model.generationError = nil
+                        model.makeConfiguredShorts()
+                    }
+                    .controlSize(.large)
+                    Button(needsKey ? "Open Settings" : "Change clip length or range") {
+                        model.generationError = nil
+                        model.player?.pause()
+                        model.screen = needsKey ? .settings : .importSource
+                    }
+                    .buttonStyle(.prismPrimary).keyboardShortcut(.defaultAction)
+                }
+            }
+            .padding(24)
+            .frame(width: 460)
+            .background(EditorStyle.panel, in: RoundedRectangle(cornerRadius: 16))
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(EditorStyle.line))
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("No Shorts found")
+        }
     }
 
     var editingWorkspace: some View {
@@ -65,72 +174,105 @@ extension ContentView {
                 }
                 EditorInspector(model: model).frame(width: rightSidebarWidth)
             }.frame(maxHeight: .infinity)
-            if let progress = model.generationProgress {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        Text(model.generationStage)
-                        Spacer()
-                        Text("\(Int(progress * 100))%")
-                        Button("Cancel") { model.cancelGeneration() }
-                            .disabled(model.generationStage == "Cancelling…")
-                    }.font(Prism.text(12))
-                    PrismProgressLine(value: progress)
-                }.padding(12).background(EditorStyle.panel)
+            EditorSidebarDivider(axis: .vertical) {
+                timelineHeight = min(620, max(150, timelineHeight - $0))
             }
-            EditorTimeline(model: model).frame(height: 278)
+            EditorTimeline(model: model).frame(height: timelineHeight)
             HStack(spacing: 8) {
                 if model.isBusy || model.isPreviewLoading { ProgressView().controlSize(.mini) }
                 Text(model.message).font(Prism.text(11)).lineLimit(1).textSelection(.enabled)
                 Spacer()
-                Text("1080 × 1920 · 30 fps · MP4").font(Prism.mono(10)).foregroundStyle(Prism.textSecondary)
+                Text("1080 × 1920 · 30 fps · MP4").font(Prism.mono(11)).foregroundStyle(Prism.textSecondary)
             }.padding(.horizontal, 16).frame(height: 28).background(EditorStyle.panel)
         }.background(EditorStyle.line)
+        .background(EditorShortcuts(model: model))
+    }
+}
+
+/// Space plays or pauses, ←/→ seek 1 s (⇧ 5 s), Delete removes the open Short, ⌘Z undoes. Ignored while typing or while a popup covers the editor.
+private struct EditorShortcuts: View {
+    let model: AppModel
+    @State private var monitor: Any?
+    var body: some View {
+        Color.clear
+            .onAppear {
+                monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                    handle(event) ? nil : event
+                }
+            }
+            .onDisappear { if let monitor { NSEvent.removeMonitor(monitor) }; monitor = nil }
+    }
+
+    @MainActor private func handle(_ event: NSEvent) -> Bool {
+        guard model.screen == .editor, model.generationProgress == nil, model.generationError == nil, model.exportSummary == nil,
+              !(event.window?.firstResponder is NSText) else { return false }
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        switch (event.keyCode, modifiers) {
+        case (49, []): model.togglePlayback()
+        case (123, []), (123, .shift), (123, [.shift, .numericPad, .function]), (123, [.numericPad, .function]):
+            model.seekPreview(by: modifiers.contains(.shift) ? -5 : -1)
+        case (124, []), (124, .shift), (124, [.shift, .numericPad, .function]), (124, [.numericPad, .function]):
+            model.seekPreview(by: modifiers.contains(.shift) ? 5 : 1)
+        case (51, []), (117, []), (117, .function):
+            guard let id = model.previewShortID, !model.isBusy else { return false }
+            model.removeShort(id)
+        case (6, .command):
+            guard !model.editHistory.isEmpty, !model.isBusy else { return false }
+            model.undoFromEditor()
+        default: return false
+        }
+        return true
     }
 }
 
 private struct EditorSidebarDivider: View {
+    /// `.horizontal` drags left/right between sidebars; `.vertical` drags up/down above the timeline.
+    var axis: Axis = .horizontal
     let onDrag: (CGFloat) -> Void
     @State private var lastTranslation: CGFloat = 0
     @State private var isHovering = false
 
     var body: some View {
+        // Zero layout thickness: the stack's 1px gap is the visible line; the overlay is a wider, invisible grab zone.
+        Color.clear
+            .frame(width: axis == .horizontal ? 0 : nil, height: axis == .vertical ? 0 : nil)
+            .frame(maxWidth: axis == .vertical ? .infinity : nil, maxHeight: axis == .horizontal ? .infinity : nil)
+            .overlay { grabZone }
+            .zIndex(1)
+    }
+
+    private var grabZone: some View {
         Rectangle()
-            .fill(isHovering ? EditorStyle.accent.opacity(0.75) : EditorStyle.line)
-            .frame(width: 7)
-            .frame(maxHeight: .infinity)
+            .fill(isHovering ? EditorStyle.accent.opacity(0.75) : .clear)
+            .frame(width: axis == .horizontal ? 2 : nil, height: axis == .vertical ? 2 : nil)
+            .frame(width: axis == .horizontal ? 9 : nil, height: axis == .vertical ? 9 : nil)
             .contentShape(Rectangle())
             .gesture(
-                DragGesture(minimumDistance: 1)
+                DragGesture(minimumDistance: 1, coordinateSpace: .global)
                     .onChanged { value in
-                        onDrag(value.translation.width - lastTranslation)
-                        lastTranslation = value.translation.width
+                        let translation = axis == .horizontal ? value.translation.width : value.translation.height
+                        onDrag(translation - lastTranslation)
+                        lastTranslation = translation
                     }
                     .onEnded { _ in lastTranslation = 0 }
             )
-            .onHover { isHovering = $0 }
             .onHover { hovering in
                 isHovering = hovering
-                if hovering { NSCursor.resizeLeftRight.push() }
+                if hovering { (axis == .horizontal ? NSCursor.resizeLeftRight : NSCursor.resizeUpDown).push() }
                 else { NSCursor.pop() }
             }
-            .help("Drag to resize sidebar")
-            .accessibilityLabel("Resize sidebar")
+            .help(axis == .horizontal ? "Drag to resize sidebar" : "Drag to resize timeline")
+            .accessibilityLabel(axis == .horizontal ? "Resize sidebar" : "Resize timeline")
     }
 }
 
-/// Approximates exported captions: heavy white text, black outline, and a yellow spoken word for Viral.
-struct CaptionStyleSample: View {
-    let highlight: Bool
-    var size: CGFloat = 30
+/// A subtitle style's sample, drawn by the export code itself, so the picker shows exactly what the video gets.
+struct CaptionStylePreview: View {
+    let style: CaptionStyle
     var body: some View {
-        let outline = max(1, size / 20)
-        (Text("Hello ").foregroundStyle(highlight ? Color.yellow : .white) + Text("everyone").foregroundStyle(.white))
-            .font(.system(size: size, weight: .heavy))
-            // Hard shadows on four sides stand in for the stroked outline drawn in exports.
-            .shadow(color: .black, radius: 0, x: outline, y: outline)
-            .shadow(color: .black, radius: 0, x: -outline, y: -outline)
-            .shadow(color: .black, radius: 0, x: outline, y: -outline)
-            .shadow(color: .black, radius: 0, x: -outline, y: outline)
+        if let image = ShortMaker.captionPreview(style) {
+            Image(decorative: image, scale: 1).resizable().scaledToFit()
+        }
     }
 }
 
@@ -153,17 +295,35 @@ private struct EditorCaptionsPanel: View {
 
     @ViewBuilder
     func content(_ clip: EditSegment) -> some View {
-        let current: CaptionStyle = clip.captionStyle == .viral ? .viral : .classic
+        let current = (clip.captionStyle ?? .classic).resolved
         let hasAudio = model.project?.media.first(where: { $0.id == clip.mediaID })?.hasAudio == true
         let cues = clip.captions ?? []
         VStack(alignment: .leading, spacing: 10) {
             Text("Caption style").font(Prism.text(14, .medium))
-            styleButton(.classic, title: "Simple", detail: "White text, black outline", selected: current == .classic)
-            styleButton(.viral, title: "Viral", detail: "Spoken word turns yellow", selected: current == .viral)
-            if current == .viral && clip.speechWords?.isEmpty != false {
-                Text("Yellow highlights need word timing, which this Short doesn't have yet. Transcribe it to add timing; until then captions show without highlights.")
-                    .font(Prism.text(10)).foregroundStyle(Prism.amber).fixedSize(horizontal: false, vertical: true)
+            ForEach(CaptionStyle.allCases) { style in
+                styleButton(style, title: style.title, detail: style.detail, selected: current == style)
             }
+            if current.usesWordTiming && clip.speechWords?.isEmpty != false {
+                Text(model.isBusy
+                     ? "Timing the words on this Mac so captions follow the speech…"
+                     : "\(current.title) follows each spoken word, which needs word timing this Short doesn't have. Transcribe it to add timing; until then captions show as whole phrases.")
+                    .font(Prism.text(11)).foregroundStyle(Prism.amber).fixedSize(horizontal: false, vertical: true)
+            }
+            Text("Position").font(Prism.text(12, .medium)).padding(.top, 6)
+            Picker("Subtitle position", selection: Binding(get: { clip.captionPosition ?? .bottom },
+                                                           set: { model.setSelectedCaptionLayout(position: $0) })) {
+                ForEach(CaptionPosition.allCases) { Text($0.title).tag($0) }
+            }
+            .pickerStyle(.segmented).labelsHidden()
+            Text("Size").font(Prism.text(12, .medium))
+            Picker("Subtitle size", selection: Binding(get: { clip.captionSize ?? .medium },
+                                                       set: { model.setSelectedCaptionLayout(size: $0) })) {
+                ForEach(CaptionSize.allCases) { Text($0.title).tag($0) }
+            }
+            .pickerStyle(.segmented).labelsHidden()
+            Toggle("Pop-in animation", isOn: Binding(get: { clip.captionAnimated == true },
+                                                     set: { model.setSelectedCaptionLayout(animated: $0) }))
+                .font(Prism.text(12)).toggleStyle(.switch).controlSize(.small)
         }
         Divider()
         VStack(alignment: .leading, spacing: 10) {
@@ -171,9 +331,9 @@ private struct EditorCaptionsPanel: View {
                 Text("Caption text").font(Prism.text(14, .medium))
                 Spacer()
                 Button { model.regenerateSelectedSubtitles() } label: {
-                    Label("Transcribe", systemImage: "waveform").font(Prism.text(10, .medium))
+                    Label("Transcribe", systemImage: "waveform").font(Prism.text(11, .medium))
                 }
-                .buttonStyle(.plain).foregroundStyle(EditorStyle.accent)
+                .buttonStyle(.prismLink).foregroundStyle(EditorStyle.accent)
                 .disabled(model.isBusy || !hasAudio)
                 .accessibilityLabel("Transcribe speech into captions")
                 .help(hasAudio
@@ -186,7 +346,12 @@ private struct EditorCaptionsPanel: View {
             } else {
                 ForEach(Array(cues.enumerated()), id: \.offset) { index, cue in
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(editorTime(cue.start)).font(Prism.mono(9)).foregroundStyle(Prism.textSecondary)
+                        Button { model.seekPreview(to: cue.start) } label: {
+                            Label(editorTime(cue.start), systemImage: "play.circle").font(Prism.mono(11))
+                        }
+                        .buttonStyle(.prismLink).foregroundStyle(Prism.textSecondary)
+                        .help("Jump to this line in the preview")
+                        .accessibilityLabel("Jump to \(editorTime(cue.start))")
                         TextField("Caption line", text: Binding(
                             get: { drafts.indices.contains(index) ? drafts[index] : cue.text },
                             set: { if drafts.indices.contains(index) { drafts[index] = $0 } }))
@@ -196,13 +361,15 @@ private struct EditorCaptionsPanel: View {
                     }
                 }
                 Text("Clear a line to remove it. Changing a line's words turns off its yellow highlight.")
-                    .font(Prism.text(10)).foregroundStyle(Prism.textSecondary).fixedSize(horizontal: false, vertical: true)
+                    .font(Prism.text(11)).foregroundStyle(Prism.textSecondary).fixedSize(horizontal: false, vertical: true)
                 Button { model.updateSelectedCaptionTexts(drafts) } label: {
                     Text("Save captions").font(Prism.text(12, .medium)).frame(maxWidth: .infinity).padding(.vertical, 9)
                         .foregroundStyle(Prism.ink).background(Prism.action, in: RoundedRectangle(cornerRadius: 8))
                 }
                 .buttonStyle(.plain)
                 .disabled(model.isBusy || drafts == cues.map(\.text))
+                .keyboardShortcut("s", modifiers: .command)
+                .help("Save captions · ⌘S")
             }
         }
         .disabled(model.isBusy)
@@ -211,12 +378,13 @@ private struct EditorCaptionsPanel: View {
     func styleButton(_ style: CaptionStyle, title: String, detail: String, selected: Bool) -> some View {
         Button { model.setSelectedCaptionStyle(style) } label: {
             HStack(spacing: 10) {
-                CaptionStyleSample(highlight: style == .viral, size: 13)
+                CaptionStylePreview(style: style)
+                    .padding(.horizontal, 4)
                     .frame(width: 112, height: 34)
-                    .background(Color.gray.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
+                    .background(Color(white: 0.28), in: RoundedRectangle(cornerRadius: 8))
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title).font(Prism.text(12, .medium))
-                    Text(detail).font(Prism.text(10)).foregroundStyle(Prism.textSecondary).fixedSize(horizontal: false, vertical: true)
+                    Text(detail).font(Prism.text(11)).foregroundStyle(Prism.textSecondary).fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 0)
                 Image(systemName: selected ? "checkmark.circle.fill" : "circle")
@@ -256,11 +424,11 @@ private struct EditorMediaBin: View {
                             VStack(alignment: .leading, spacing: 10) {
                                 HStack {
                                     Text("Shorts").font(Prism.text(14, .medium))
-                                    Text("\(clips.count)").font(Prism.text(10, .medium)).foregroundStyle(Prism.textSecondary)
+                                    Text("\(clips.count)").font(Prism.text(11, .medium)).foregroundStyle(Prism.textSecondary)
                                     Spacer()
                                     Button { model.makeConfiguredShorts() } label: {
-                                        Label("Create more", systemImage: "sparkles").font(Prism.text(10, .medium)).foregroundStyle(EditorStyle.accent)
-                                    }.buttonStyle(.plain).help("Analyze this video's unused moments for more Shorts").disabled(model.isBusy)
+                                        Label("Create more", systemImage: "sparkles").font(Prism.text(11, .medium)).foregroundStyle(EditorStyle.accent)
+                                    }.buttonStyle(.prismLink).help("Analyze this video's unused moments for more Shorts").disabled(model.isBusy)
                                 }
                                 LazyVGrid(columns: columns, spacing: 10) {
                                     ForEach(Array(clips.enumerated()), id: \.element.id) { index, clip in
@@ -285,22 +453,36 @@ private struct EditorMediaBin: View {
                                                         HStack(spacing: 4) {
                                                             Image(systemName: "play.fill")
                                                             Text("Short \(index + 1)").lineLimit(1)
+                                                            if clip.splitScreen == true {
+                                                                Image(systemName: "rectangle.split.1x2").help("Split screen")
+                                                            }
+                                                            if clip.selectionReason?.hasPrefix("Weaker pick") == true {
+                                                                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Prism.amber)
+                                                                    .help("Weaker pick: check this one before exporting")
+                                                            }
                                                             Spacer(minLength: 0)
                                                             Text(editorTime(clip.duration)).monospacedDigit()
-                                                        }.font(Prism.text(9, .medium)).padding(5)
+                                                        }.font(Prism.text(11, .medium)).padding(5)
                                                     }.clipShape(RoundedRectangle(cornerRadius: 4))
                                                     if let title = clip.suggestedTitle, !title.isEmpty {
-                                                        Text(title).font(Prism.text(10, .medium)).lineLimit(2)
+                                                        Text(title).font(Prism.text(11, .medium)).lineLimit(2)
                                                     }
                                                     Text("Starts at \(editorTime(clip.start))")
-                                                        .font(Prism.text(9)).foregroundStyle(Prism.textSecondary).lineLimit(1)
+                                                        .font(Prism.text(11)).foregroundStyle(Prism.textSecondary).lineLimit(1)
                                                 }.padding(5).frame(maxWidth: .infinity, alignment: .leading)
                                                     .background(model.previewShortID == clip.id ? EditorStyle.accent.opacity(0.14) : EditorStyle.inset, in: RoundedRectangle(cornerRadius: 8))
                                                     .overlay(RoundedRectangle(cornerRadius: 8).stroke(model.previewShortID == clip.id ? EditorStyle.accent : .clear, lineWidth: 1))
                                             }.buttonStyle(.plain).accessibilityLabel("Preview Short \(index + 1)")
+                                            .contextMenu {
+                                                Button("Preview") { model.selection = clip.mediaID; model.selectPreview(clip.id) }
+                                                Button("Export this Short") { model.export(only: clip.id) }
+                                                Divider()
+                                                Button("Remove Short") { model.removeShort(clip.id) }
+                                            }
+                                            .help("Right-click for more")
                                             Button { model.removeShort(clip.id) } label: {
                                                 Image(systemName: "xmark")
-                                                    .font(Prism.text(9, .medium))
+                                                    .font(Prism.text(11, .medium))
                                                     .foregroundStyle(.white)
                                                     .frame(width: 22, height: 22)
                                                     .background(.black.opacity(0.78), in: Circle())
@@ -319,8 +501,8 @@ private struct EditorMediaBin: View {
                         HStack {
                             Text("Main video").font(Prism.text(14, .medium))
                             Spacer()
-                            Button { model.importVideo() } label: { Image(systemName: "plus") }
-                                .buttonStyle(.plain).help("Import video").accessibilityLabel("Import video")
+                            Button { model.importVideo() } label: { Image(systemName: "plus") }.buttonStyle(.prismIcon)
+                                .help("Import video").accessibilityLabel("Import video")
                                 .disabled(model.isBusy)
                         }
                         Button { model.importVideo() } label: {
@@ -344,12 +526,12 @@ private struct EditorMediaBin: View {
                                                     .clipped()
                                                     .background(EditorStyle.inset)
                                                     .clipShape(RoundedRectangle(cornerRadius: 4))
-                                                Text(editorTime(media.duration)).font(Prism.mono(9))
+                                                Text(editorTime(media.duration)).font(Prism.mono(11))
                                                     .padding(.horizontal, 4).padding(.vertical, 2)
                                                     .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 3)).padding(4)
                                             }
-                                            Text(media.name).font(Prism.text(10)).lineLimit(1)
-                                            Text("\(media.width) × \(media.height)").font(Prism.text(9)).foregroundStyle(Prism.textSecondary)
+                                            Text(media.name).font(Prism.text(11)).lineLimit(1)
+                                            Text("\(media.width) × \(media.height)").font(Prism.text(11)).foregroundStyle(Prism.textSecondary)
                                         }.padding(6).frame(maxWidth: .infinity, alignment: .leading)
                                             .background(EditorStyle.inset, in: RoundedRectangle(cornerRadius: 8))
                                             .overlay(RoundedRectangle(cornerRadius: 8).stroke(model.previewShortID == nil && model.selection == media.id ? EditorStyle.accent : .clear, lineWidth: 1))
@@ -361,7 +543,7 @@ private struct EditorMediaBin: View {
                             Button { model.addManualClip() } label: {
                                 Label("Add clip to timeline", systemImage: "plus.rectangle.on.rectangle")
                                     .font(Prism.text(11, .medium)).foregroundStyle(EditorStyle.accent)
-                            }.buttonStyle(.plain).disabled(model.isBusy)
+                            }.buttonStyle(.prismLink).disabled(model.isBusy)
                         }
                     } else {
                         EditorCaptionsPanel(model: model)
@@ -421,18 +603,30 @@ private struct EditorMediaBin: View {
 
 private struct EditorPlayer: View {
     @Bindable var model: AppModel
+    var playerTitle: String {
+        guard let clip = model.activeSegment else { return "Source video" }
+        let number = (model.project?.segments.firstIndex(where: { $0.id == clip.id }) ?? 0) + 1
+        guard let title = clip.suggestedTitle, !title.isEmpty else { return "Short \(number) preview" }
+        return "Short \(number) · \(title)"
+    }
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-            Text(model.activeSegment == nil ? "Source video" : "Short preview").font(Prism.text(12, .medium))
+            Text(playerTitle).font(Prism.text(12, .medium)).lineLimit(1)
                 Spacer()
-                Text(model.activeSegment == nil ? "Original" : "Vertical · 9:16").font(Prism.text(10)).foregroundStyle(Prism.textSecondary)
-                Button { model.selectPreview(nil) } label: { Image(systemName: "rectangle.on.rectangle") }
-                    .buttonStyle(.plain).help("Preview original source").accessibilityLabel("Preview original source")
+                Text(model.activeSegment == nil ? "Original" : "Vertical · 9:16").font(Prism.text(11)).foregroundStyle(Prism.textSecondary)
+                Button { model.selectPreview(nil) } label: { Image(systemName: "rectangle.on.rectangle") }.buttonStyle(.prismIcon)
+                    .help("Preview original source").accessibilityLabel("Preview original source")
             }.padding(.horizontal, 16).frame(height: 40)
             ZStack {
                 if let player = model.player {
                     RelioPlayerView(player: player, captionSegment: model.previewSegment)
+                        .overlay {
+                            Color.clear.contentShape(Rectangle())
+                                .onTapGesture(count: 2) { model.isPlayerExpanded = true }
+                                .onTapGesture { model.togglePlayback() }
+                                .help("Click to play or pause · double-click to fill the window")
+                        }
                 } else if model.isPreviewLoading {
                     VStack(spacing: 10) {
                         ProgressView()
@@ -459,21 +653,13 @@ private struct EditorPlayer: View {
                     Text("/ \(editorTime(model.activeSegment?.duration ?? model.project?.media.first(where: { $0.id == model.selection })?.duration ?? 0))")
                         .foregroundStyle(Prism.textSecondary)
                     Spacer()
-                    Button { model.seekPreview(to: 0) } label: { Image(systemName: "backward.end.fill") }
-                        .help("Go to start").accessibilityLabel("Go to start")
-                    Button {
-                        guard let player = model.player else { return }
-                        if player.rate != 0 { player.pause() }
-                        else {
-                            let length = model.activeSegment?.duration ?? model.project?.media.first(where: { $0.id == model.selection })?.duration ?? 0
-                            if player.currentTime().seconds >= length - 0.1 { model.seekPreview(to: 0) }
-                            player.play()
-                        }
-                    } label: { Image(systemName: model.player?.rate == 0 ? "play.fill" : "pause.fill") }
-                        .help("Play or pause").accessibilityLabel("Play or pause preview")
+                    Button { model.seekPreview(to: 0) } label: { Image(systemName: "backward.end.fill") }.buttonStyle(.prismIcon)
+                        .help("Go to start · ← → to step, ⇧ for 5 s").accessibilityLabel("Go to start")
+                    Button { model.togglePlayback() } label: { Image(systemName: model.player?.rate == 0 ? "play.fill" : "pause.fill") }.buttonStyle(.prismIcon)
+                        .help("Play or pause · Space").accessibilityLabel("Play or pause preview")
                     Spacer()
                     Text("30 fps").foregroundStyle(Prism.textSecondary)
-                    Button { model.isPlayerExpanded = true } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }
+                    Button { model.isPlayerExpanded = true } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }.buttonStyle(.prismIcon)
                         .help("Fill the window · press Esc to exit").accessibilityLabel("Expand preview to fill the window")
                 }.font(Prism.mono(11)).buttonStyle(.plain)
                     .disabled(model.player == nil).padding(.horizontal, 18).frame(height: 44)
@@ -504,7 +690,7 @@ private struct EditorInspector: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 12) {
                         Text(model.useGemini ? "Gemini · Cloud" : model.aiModelName == "Not installed" ? "Built-in editing commands" : "\(model.aiModelName) · Local")
-                            .font(Prism.text(10)).foregroundStyle(EditorStyle.accent)
+                            .font(Prism.text(11)).foregroundStyle(EditorStyle.accent)
                         ForEach(model.chatMessages) { item in
                             Text(item.text).font(Prism.text(12)).padding(10)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -515,8 +701,8 @@ private struct EditorInspector: View {
                 HStack {
                     TextField("Describe an edit…", text: $model.chatInput).textFieldStyle(.plain).onSubmit { model.sendChat() }
                         .accessibilityLabel("Editing instruction")
-                    Button { model.sendChat() } label: { Image(systemName: "arrow.up.circle.fill") }
-                        .buttonStyle(.plain).foregroundStyle(EditorStyle.accent).accessibilityLabel("Send editing instruction")
+                    Button { model.sendChat() } label: { Image(systemName: "arrow.up.circle.fill") }.buttonStyle(.prismIcon)
+                        .foregroundStyle(EditorStyle.accent).accessibilityLabel("Send editing instruction")
                 }.font(Prism.text(12)).padding(12).background(EditorStyle.inset).padding(12).disabled(model.isBusy)
             } else {
                 ScrollView {
@@ -525,27 +711,42 @@ private struct EditorInspector: View {
                             Text(clip.suggestedTitle ?? "Video").font(Prism.text(13, .medium))
                             if let reason = clip.selectionReason, !reason.isEmpty {
                                 VStack(alignment: .leading, spacing: 5) {
-                                    Text("Why suggested").font(Prism.text(10, .medium))
-                                    Text(reason).font(Prism.text(11)).foregroundStyle(Prism.textSecondary).fixedSize(horizontal: false, vertical: true)
+                                    Text("Why suggested").font(Prism.text(11, .medium))
+                                    Text(reason).font(Prism.text(11))
+                                        .foregroundStyle(reason.hasPrefix("Weaker pick") ? Prism.amber : Prism.textSecondary)
+                                        .fixedSize(horizontal: false, vertical: true)
                                 }
                             }
                             if let notice = clip.captionNotice, !notice.isEmpty {
                                 Label(notice, systemImage: "info.circle").font(Prism.text(11)).foregroundStyle(Prism.amber)
                                     .fixedSize(horizontal: false, vertical: true)
                             }
-                            Text("Clip range").font(Prism.text(10, .medium)).foregroundStyle(Prism.textSecondary)
+                            Text("Clip range").font(Prism.text(11, .medium)).foregroundStyle(Prism.textSecondary)
                             numberField("Start (seconds)", value: $start)
                             numberField(clip.speechWords?.isEmpty == false ? "Target duration (seconds)" : "Duration (seconds)", value: $duration)
+                            Text("\(editorTime(start)) → \(editorTime(start + duration)) in the source video")
+                                .font(Prism.mono(11)).foregroundStyle(Prism.textSecondary)
                             if clip.speechWords?.isEmpty == false {
                                 Text("Cuts move slightly to keep the first and last spoken words whole.")
-                                    .font(Prism.text(10)).foregroundStyle(Prism.textSecondary)
+                                    .font(Prism.text(11)).foregroundStyle(Prism.textSecondary)
                             }
                             Divider()
-                            Text("Video layout").font(Prism.text(10, .medium)).foregroundStyle(Prism.textSecondary)
+                            Text("Video layout").font(Prism.text(11, .medium)).foregroundStyle(Prism.textSecondary)
                             HStack(spacing: 6) {
-                                framingButton("Fit", fit: true, selected: clip.fitToFrame == true)
-                                framingButton("Fill", fit: false, selected: clip.fitToFrame != true)
+                                framingButton("Fit", fit: true, selected: clip.splitScreen != true && clip.fitToFrame == true)
+                                framingButton("Fill", fit: false, selected: clip.splitScreen != true && clip.fitToFrame != true)
+                                Button { model.setSplitScreen() } label: {
+                                    Label("Split", systemImage: "rectangle.split.1x2")
+                                        .font(Prism.text(11)).frame(maxWidth: .infinity).padding(8)
+                                        .foregroundStyle(clip.splitScreen == true ? EditorStyle.accent : Prism.textSecondary)
+                                        .background(clip.splitScreen == true ? EditorStyle.accent.opacity(0.1) : Prism.surface1, in: RoundedRectangle(cornerRadius: 4))
+                                        .overlay(RoundedRectangle(cornerRadius: 4).stroke(clip.splitScreen == true ? EditorStyle.accent.opacity(0.5) : .clear))
+                                }.buttonStyle(.plain).accessibilityLabel("Split screen for two people")
                             }
+                            if clip.splitScreen == true {
+                                Text("Two people: the left side of the video shows on top, the right side on the bottom. Captions sit in the middle.")
+                                    .font(Prism.text(11)).foregroundStyle(Prism.textSecondary)
+                            } else {
                             if clip.fitToFrame != true {
                                 VStack(alignment: .leading, spacing: 4) {
                                     HStack {
@@ -553,21 +754,21 @@ private struct EditorInspector: View {
                                             .font(Prism.text(11)).foregroundStyle(Prism.textSecondary)
                                         Spacer()
                                         Text(cropPosition < 0.34 ? "Left" : cropPosition > 0.66 ? "Right" : "Center")
-                                            .font(Prism.mono(10)).foregroundStyle(Prism.textSecondary)
+                                            .font(Prism.mono(11)).foregroundStyle(Prism.textSecondary)
                                     }
                                     Slider(value: $cropPosition, in: 0...1, step: 0.01)
                                         .tint(Prism.accent)
                                         .accessibilityLabel(clip.cropKeyframes == nil ? "Horizontal crop position" : "Subject tracking offset")
                                     HStack {
                                         Text("Left"); Spacer(); Text("Center"); Spacer(); Text("Right")
-                                    }.font(Prism.text(9)).foregroundStyle(Prism.textSecondary)
+                                    }.font(Prism.text(11)).foregroundStyle(Prism.textSecondary)
                                 }
                                 VStack(alignment: .leading, spacing: 4) {
                                     HStack {
                                         Text("Crop zoom").font(Prism.text(11)).foregroundStyle(Prism.textSecondary)
                                         Spacer()
                                         Text("\(Int(cropZoom * 100))%")
-                                            .font(Prism.mono(10)).foregroundStyle(Prism.textSecondary)
+                                            .font(Prism.mono(11)).foregroundStyle(Prism.textSecondary)
                                     }
                                     Slider(value: $cropZoom, in: 1...1.5, step: 0.05)
                                         .tint(Prism.accent)
@@ -593,32 +794,34 @@ private struct EditorInspector: View {
                                             .font(Prism.text(11, .medium))
                                     }
                                 }
-                                .buttonStyle(.plain)
+                                .buttonStyle(.prismLink)
                                 .foregroundStyle(EditorStyle.accent)
                                 .disabled(model.isBusy)
                                 .help("Center the crop and hold it, or re-analyze to follow the subject")
                             }
+                            }
                             Divider()
-                            Text("On-screen text").font(Prism.text(10, .medium)).foregroundStyle(Prism.textSecondary)
+                            Text("On-screen text").font(Prism.text(11, .medium)).foregroundStyle(Prism.textSecondary)
                             TextEditor(text: $caption).font(Prism.text(12)).scrollContentBackground(.hidden)
                                 .frame(height: 70).padding(6).background(EditorStyle.inset, in: RoundedRectangle(cornerRadius: 8))
                                 .accessibilityLabel("Clip text")
                             Text("Speech captions are edited in the Captions tab.")
-                                .font(Prism.text(10)).foregroundStyle(Prism.textSecondary)
+                                .font(Prism.text(11)).foregroundStyle(Prism.textSecondary)
                             numberField("Text starts at", value: $captionStart)
                             numberField("Text duration", value: $captionDuration)
-                            Text("Times are relative to this Short.").font(Prism.text(10)).foregroundStyle(Prism.textSecondary)
-                            Button {
-                                model.updateSelectedEdit(start: start, duration: duration, caption: caption, captionStart: captionStart,
-                                    captionDuration: min(captionDuration, max(0, duration - captionStart)), cropZoom: cropZoom,
-                                    cropPosition: cropPosition)
-                            } label: {
+                            Text("Times are relative to this Short.").font(Prism.text(11)).foregroundStyle(Prism.textSecondary)
+                            Button { applyDraft() } label: {
                                 Text("Apply changes").font(Prism.text(12, .medium)).frame(maxWidth: .infinity).padding(.vertical, 9)
                                     .foregroundStyle(Prism.ink).background(Prism.action, in: RoundedRectangle(cornerRadius: 8))
                             }.buttonStyle(.plain)
                             Divider()
                             Toggle("Mute source audio", isOn: Binding(get: { model.activeSegment?.isMuted == true }, set: { _ in model.toggleSelectedAudio() }))
                                 .font(Prism.text(12)).toggleStyle(.switch).controlSize(.small)
+                            Button { model.export(only: clip.id) } label: {
+                                Label("Export this Short", systemImage: "square.and.arrow.up").frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.prismSecondary)
+                            .help("Render only this Short to the Exports folder")
                         } else {
                             Image(systemName: "slider.horizontal.3").font(Prism.text(25)).foregroundStyle(Prism.textSecondary).padding(.top, 35)
                             Text("Select a clip to edit").font(Prism.text(13, .medium))
@@ -668,9 +871,16 @@ private struct EditorInspector: View {
     func inspectorTab(_ title: String) -> some View {
         Button { tab = title } label: {
             Text(title).font(Prism.text(12, .medium)).foregroundStyle(tab == title ? Prism.text : Prism.textSecondary)
+                .padding(.horizontal, 4)
                 .frame(height: 40).overlay(alignment: .bottom) { if tab == title { Prism.accent.frame(height: 2) } }
+                .contentShape(Rectangle())
         }.buttonStyle(.plain)
         .accessibilityAddTraits(tab == title ? .isSelected : [])
+    }
+    func applyDraft() {
+        model.updateSelectedEdit(start: start, duration: duration, caption: caption, captionStart: captionStart,
+            captionDuration: min(captionDuration, max(0, duration - captionStart)), cropZoom: cropZoom,
+            cropPosition: cropPosition)
     }
     func numberField(_ title: String, value: Binding<Double>) -> some View {
         HStack {
@@ -679,6 +889,8 @@ private struct EditorInspector: View {
             TextField(title, value: value, format: .number.precision(.fractionLength(0...2)))
                 .textFieldStyle(.plain).multilineTextAlignment(.trailing).font(Prism.mono(11))
                 .frame(width: 74).padding(7).background(EditorStyle.inset, in: RoundedRectangle(cornerRadius: 4))
+                .onSubmit { applyDraft() }
+                .help("Press Return to apply")
                 .accessibilityLabel(title)
         }
     }
@@ -703,9 +915,9 @@ private struct EditorTimeline: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 18) {
-                Button { model.undoFromEditor() } label: { Image(systemName: "arrow.uturn.backward") }
-                    .help("Undo edit").disabled(model.editHistory.isEmpty || model.isBusy)
-                Button { model.toggleSelectedAudio() } label: { Image(systemName: model.activeSegment?.isMuted == true ? "speaker.slash" : "speaker.wave.2") }
+                Button { model.undoFromEditor() } label: { Image(systemName: "arrow.uturn.backward") }.buttonStyle(.prismIcon)
+                    .help("Undo edit · ⌘Z").disabled(model.editHistory.isEmpty || model.isBusy)
+                Button { model.toggleSelectedAudio() } label: { Image(systemName: model.activeSegment?.isMuted == true ? "speaker.slash" : "speaker.wave.2") }.buttonStyle(.prismIcon)
                     .help("Toggle clip audio").disabled(model.activeSegment == nil || model.isBusy)
                     .accessibilityLabel("Toggle clip audio")
                 Rectangle().fill(EditorStyle.line).frame(width: 1, height: 16)
@@ -714,10 +926,11 @@ private struct EditorTimeline: View {
                 Button("Add clip") { model.addManualClip() }.disabled(media == nil || model.isBusy)
                 Button { model.makeConfiguredShorts() } label: { Label("Auto Shorts", systemImage: "sparkles") }
                     .disabled(media == nil || model.isBusy)
-                Button { model.screen = .importSource } label: { Image(systemName: "gearshape") }
+                Button { model.screen = .importSource } label: { Image(systemName: "gearshape") }.buttonStyle(.prismIcon)
                     .help("Auto Shorts settings").accessibilityLabel("Auto Shorts settings").disabled(model.isBusy)
-            }.font(Prism.text(12)).buttonStyle(.plain).padding(.horizontal, 18).frame(height: 42)
+            }.font(Prism.text(12)).buttonStyle(.prismLink).padding(.horizontal, 18).frame(height: 42)
             Divider()
+            ScrollView(.vertical) {
             HStack(spacing: 0) {
                 VStack(spacing: 0) {
                     Color.clear.frame(height: 28)
@@ -732,18 +945,23 @@ private struct EditorTimeline: View {
                     VStack(spacing: 8) {
                         HStack {
                             ForEach(0..<7, id: \.self) { index in
-                                Text(editorTime(length * Double(index) / 6)).font(Prism.mono(10)).foregroundStyle(Prism.textSecondary)
+                                Text(editorTime(length * Double(index) / 6)).font(Prism.mono(11)).foregroundStyle(Prism.textSecondary)
                                 if index != 6 { Spacer(minLength: 0) }
                             }
                         }.frame(height: 20)
                         videoTrack(width: width).frame(height: 60)
+                            .simultaneousGesture(DragGesture(minimumDistance: 0).onChanged { value in
+                                // On the source timeline the track holds clip buttons, so only a Short's track scrubs.
+                                guard model.activeSegment != nil else { return }
+                                model.seekPreview(to: Double(value.location.x / width) * length)
+                            })
                         focusTrack(width: width).frame(height: 22)
                         textTrack(width: width).frame(height: 30)
                         HStack {
                             Image(systemName: model.activeSegment?.isMuted == true ? "speaker.slash.fill" : "waveform")
                             Text(model.activeSegment?.isMuted == true ? "Muted" : media?.hasAudio == true ? "Source audio" : "No audio")
                             Spacer()
-                        }.font(Prism.text(10)).foregroundStyle(Prism.text).padding(.horizontal, 10)
+                        }.font(Prism.text(11)).foregroundStyle(Prism.text).padding(.horizontal, 10)
                             .frame(height: 30).background(media?.hasAudio == true && model.activeSegment?.isMuted != true ? Prism.sky.opacity(0.22) : Prism.surface1, in: RoundedRectangle(cornerRadius: 4))
                     }.padding(.horizontal, 12).padding(.top, 4)
                     TimelineView(.periodic(from: .now, by: 0.1)) { _ in
@@ -751,7 +969,7 @@ private struct EditorTimeline: View {
                         let x = 12 + width * max(0, min(1, (time.isFinite ? time : 0) / length))
                         ZStack(alignment: .top) {
                             Rectangle().fill(.white).frame(width: 1, height: 173)
-                            Image(systemName: "arrowtriangle.down.fill").font(Prism.text(10)).foregroundStyle(Prism.text).offset(y: -1)
+                            Image(systemName: "arrowtriangle.down.fill").font(Prism.text(11)).foregroundStyle(Prism.text).offset(y: -1)
                         }.position(x: x, y: 100).allowsHitTesting(false)
                     }
                     Color.clear.contentShape(Rectangle()).frame(height: 25)
@@ -760,11 +978,12 @@ private struct EditorTimeline: View {
                         })
                         .accessibilityLabel("Timeline seek ruler")
                 }
+            }.frame(height: 235)
             }
         }.background(EditorStyle.panel)
     }
     func trackLabel(_ title: String, _ icon: String, height: CGFloat) -> some View {
-        Label(title, systemImage: icon).font(Prism.text(10)).foregroundStyle(Prism.textSecondary)
+        Label(title, systemImage: icon).font(Prism.text(11)).foregroundStyle(Prism.textSecondary)
             .frame(maxWidth: .infinity, alignment: .leading).padding(.leading, 15).frame(height: height)
     }
     func videoTrack(width: CGFloat) -> some View {
@@ -773,7 +992,7 @@ private struct EditorTimeline: View {
             if let media {
                 TimelineFilmstrip(media: media, width: width, height: 60)
                     .opacity(0.82)
-                Text(media.name).font(Prism.text(10, .medium)).lineLimit(1)
+                Text(media.name).font(Prism.text(11, .medium)).lineLimit(1)
                     .padding(5).background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 3)).padding(6)
                 if model.activeSegment == nil {
                     ForEach(model.project?.segments.filter { $0.mediaID == media.id } ?? []) { clip in
@@ -798,7 +1017,7 @@ private struct EditorTimeline: View {
                 if !clip.caption.isEmpty {
                     let start = max(0, min(length, clip.captionStart ?? 0))
                     let duration = max(0, min(length - start, clip.captionDuration ?? clip.duration))
-                    Text(clip.caption).font(Prism.text(9, .medium)).lineLimit(1).padding(.horizontal, 8)
+                    Text(clip.caption).font(Prism.text(11, .medium)).lineLimit(1).padding(.horizontal, 8)
                         .frame(width: max(1, width * duration / length), height: 30, alignment: .leading)
                         .background(Prism.amber.opacity(0.32), in: RoundedRectangle(cornerRadius: 4))
                         .offset(x: width * start / length)
@@ -813,10 +1032,10 @@ private struct EditorTimeline: View {
                         .accessibilityLabel("Subtitle \(cue.text) at \(editorTime(start))")
                 }
                 if clip.caption.isEmpty && subtitles.isEmpty {
-                    Text("No text or subtitles").font(Prism.text(10)).foregroundStyle(Prism.textSecondary).padding(.leading, 10)
+                    Text("No text or subtitles").font(Prism.text(11)).foregroundStyle(Prism.textSecondary).padding(.leading, 10)
                 }
             } else {
-                Text("Select a Short to edit text and subtitles").font(Prism.text(10)).foregroundStyle(Prism.textSecondary).padding(.leading, 10)
+                Text("Select a Short to edit text and subtitles").font(Prism.text(11)).foregroundStyle(Prism.textSecondary).padding(.leading, 10)
             }
         }
     }
@@ -828,7 +1047,9 @@ private struct EditorTimeline: View {
             let offset = (model.activeSegment?.cropPosition ?? 0.5) - 0.5
             ZStack(alignment: .leading) {
                 RoundedRectangle(cornerRadius: 4).fill(EditorStyle.accent.opacity(0.06))
-                if points.count > 1, let clip = model.activeSegment {
+                if model.activeSegment?.splitScreen == true {
+                    Text("Split screen · each half stays on its speaker").font(Prism.text(11)).foregroundStyle(Prism.textSecondary).padding(.leading, 8)
+                } else if points.count > 1, let clip = model.activeSegment {
                     Path { path in
                         for (index, point) in points.enumerated() {
                             let x = width * min(1, max(0, point.time / max(0.1, clip.duration)))
@@ -850,13 +1071,13 @@ private struct EditorTimeline: View {
                     }.stroke(EditorStyle.accent.opacity(0.85), style: StrokeStyle(lineWidth: 2, lineCap: .round))
                 } else {
                     Text(model.activeSegment == nil ? "Select a Short to view its focus path" : "Click or drag to set focus")
-                        .font(Prism.text(9)).foregroundStyle(Prism.textSecondary).padding(.leading, 8)
+                        .font(Prism.text(11)).foregroundStyle(Prism.textSecondary).padding(.leading, 8)
                 }
             }
             .contentShape(Rectangle())
             .gesture(DragGesture(minimumDistance: 0)
                 .onEnded { value in
-                    guard let clip = model.activeSegment else { return }
+                    guard let clip = model.activeSegment, clip.splitScreen != true else { return }
                     let sourceTime = min(clip.duration, max(0, value.startLocation.x / max(1, width) * clip.duration))
                     let targetTime = min(clip.duration, max(0, value.location.x / max(1, width) * clip.duration))
                     let position = min(1, max(0, 1 - value.location.y / max(1, height)))

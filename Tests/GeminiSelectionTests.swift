@@ -6,20 +6,47 @@ final class GeminiMockProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var finish = "STOP"
     nonisolated(unsafe) static var statuses: [Int] = []
     nonisolated(unsafe) static var payloads: [String] = []
+    /// Every request body sent, so tests can check what the prompts contain.
+    nonisolated(unsafe) static var bodies: [String] = []
+    /// Sent instead of a Gemini answer when the status isn't 200, like a real quota error body.
+    nonisolated(unsafe) static var errorBody: String?
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
+        // URLSession hands the body over as a stream inside a protocol.
+        var body = request.httpBody ?? Data()
+        if body.isEmpty, let stream = request.httpBodyStream {
+            stream.open()
+            var buffer = [UInt8](repeating: 0, count: 65_536)
+            while stream.hasBytesAvailable {
+                let count = stream.read(&buffer, maxLength: buffer.count)
+                if count <= 0 { break }
+                body.append(buffer, count: count)
+            }
+            stream.close()
+        }
+        Self.bodies.append(String(decoding: body, as: UTF8.self))
         precondition(request.url?.query == nil, "Credentials must not be put in the URL")
         precondition(request.value(forHTTPHeaderField: "x-goog-api-key") == "test-key")
         let response = HTTPURLResponse(url: request.url!, statusCode: Self.statuses.isEmpty ? Self.status : Self.statuses.removeFirst(), httpVersion: nil, headerFields: nil)!
-        let payload = Self.payloads.isEmpty ? "{\"ok\":true}" : Self.payloads.removeFirst()
-        let data = try! JSONSerialization.data(withJSONObject: ["candidates": [["finishReason": Self.finish,
-            "content": ["parts": [["thought": true, "text": "ignore"], ["text": payload]]]]]])
+        let data: Data
+        if response.statusCode != 200, let errorBody = Self.errorBody {
+            data = Data(errorBody.utf8)
+        } else {
+            let payload = Self.payloads.isEmpty ? "{\"ok\":true}" : Self.payloads.removeFirst()
+            data = try! JSONSerialization.data(withJSONObject: ["candidates": [["finishReason": Self.finish,
+                "content": ["parts": [["thought": true, "text": "ignore"], ["text": payload]]]]]])
+        }
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: data)
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() {}
+}
+
+/// Collects the transcript the pipeline hands back for saving.
+final class TranscriptBox: @unchecked Sendable {
+    var value: SentenceTranscript?
 }
 
 @main struct GeminiSelectionTests {
@@ -50,6 +77,15 @@ final class GeminiMockProtocol: URLProtocol, @unchecked Sendable {
             _ = try GeminiSelection.validate([Clip(start: 5, end: 35, score: 6.9, layout: "fit")],
                 interval: (0, 60), targetDuration: 30, count: 1)
             preconditionFailure("Borderline moments must not be returned as finished Shorts")
+        } catch GeminiSelection.Failure.noStrongClips {}
+        let fallback = try GeminiSelection.strongestOrBest([Clip(start: 5, end: 35, score: 6, layout: "fit", reason: "Good hook.")],
+            interval: (0, 100), targetDuration: 30, count: 1, excluding: [])
+        precondition(fallback.count == 1 && fallback[0].reason?.hasPrefix("Weaker pick") == true && fallback[0].reason?.hasSuffix("Good hook.") == true,
+                     "With no clip scoring 7, the best 5–6 clip must be used and labeled, not fail the run")
+        do {
+            _ = try GeminiSelection.strongestOrBest([Clip(start: 5, end: 35, score: 4, layout: "fit")],
+                interval: (0, 100), targetDuration: 30, count: 1, excluding: [])
+            fatalError("A clip scoring below 5 must still be rejected")
         } catch GeminiSelection.Failure.noStrongClips {}
         let ranking = try GeminiSelection.rankedWindowIDs([
             .init(id: 0, score: 20), .init(id: 1, score: 10), .init(id: 2, score: 95)
@@ -142,14 +178,55 @@ final class GeminiMockProtocol: URLProtocol, @unchecked Sendable {
         let bestIDs = Array(windows.indices.reversed().prefix(shortlistSize))
         for ids in TranscriptSelection.batches(bestIDs, size: 3) {
             let id = ids[0]
-            let payload: [String: Any] = ["clips": [["start": windows[id].start, "end": windows[id].start + 30,
+            // The best clip drifts 1s before its window; it must be clamped, not dropped.
+            let payload: [String: Any] = ["clips": [["start": windows[id].start - (id == windows.count - 1 ? 1 : 0), "end": windows[id].start + 30,
                 "score": id == windows.count - 1 ? 10 : 7, "layout": "fit"]]]
             GeminiMockProtocol.payloads.append(String(decoding: try JSONSerialization.data(withJSONObject: payload), as: UTF8.self))
         }
         let planned = try await GeminiSelection.select(url: URL(fileURLWithPath: "/tmp/relio-mock-missing.mov"), cues: longCues,
-            interval: (0, 1200), targetDuration: 30, count: 1, configuration: configuration, session: session)
-        precondition(planned.count == 1 && planned[0].start == windows.last!.start, "Multi-batch cloud selection must preserve the strongest late moment")
+            interval: (0, 1200), targetDuration: 30, count: 1, configuration: configuration, detailConcurrency: 1, session: session)
+        precondition(planned.first?.start == windows.last!.start, "Multi-batch cloud selection must preserve the strongest late moment")
+        precondition(planned.count == 4, "Distinct runner-up finalists must follow the picks as backups")
         precondition(GeminiMockProtocol.payloads.isEmpty, "Every scoring and detail batch must run")
+        // Final editor pass: it may pick a lower-scored finalist, and ignores repeated or unknown ids.
+        let finalists = [Clip(start: 0, end: 30, score: 10, layout: "fit", title: "Same story"),
+                         Clip(start: 100, end: 130, score: 8, layout: "fit", title: "Different story")]
+        GeminiMockProtocol.payloads = ["{\"ids\":[1,1,7]}"]
+        let cut = await GeminiSelection.finalCut(finalists, cues: [], count: 2, guidance: "", configuration: configuration, session: session)
+        precondition(cut?.map(\.title) == ["Different story"], "Final cut keeps the editor's order and drops duplicate or invalid ids")
+        GeminiMockProtocol.payloads = ["not json"]
+        let failedCut = await GeminiSelection.finalCut(finalists, cues: [], count: 1, guidance: "", configuration: configuration, session: session)
+        precondition(failedCut == nil, "A failed final cut must fall back to score order")
+        // A per-minute quota error with a short retryDelay is waited out; without one it still fails.
+        GeminiMockProtocol.errorBody = "{\"error\":{\"code\":429,\"details\":[{\"retryDelay\":\"0s\"}]}}"
+        GeminiMockProtocol.statuses = [429, 200]
+        let waited: Check = try await GeminiSelection.generate(parts: [], schema: [:], configuration: configuration, session: session)
+        precondition(waited.ok && GeminiMockProtocol.statuses.isEmpty, "Short per-minute quota waits must retry")
+        GeminiMockProtocol.errorBody = "{\"error\":{\"code\":429,\"details\":[{\"retryDelay\":\"3600s\"}]}}"
+        GeminiMockProtocol.statuses = [429]
+        do {
+            let _: Check = try await GeminiSelection.generate(parts: [], schema: [:], configuration: configuration, session: session)
+            preconditionFailure("Long quota waits must fail instead of hanging")
+        } catch GeminiSelection.Failure.request(let code) { precondition(code == 429) }
+        GeminiMockProtocol.errorBody = nil
+        // One failed detail batch must not sink the batches that found clips.
+        GeminiMockProtocol.payloads = []
+        for ids in TranscriptSelection.batches(Array(windows.indices), size: 6) {
+            let payload: [String: Any] = ["windows": ids.map { ["id": $0, "score": Double($0)] }]
+            GeminiMockProtocol.payloads.append(String(decoding: try JSONSerialization.data(withJSONObject: payload), as: UTF8.self))
+        }
+        let scoringCount = GeminiMockProtocol.payloads.count
+        GeminiMockProtocol.statuses = Array(repeating: 200, count: scoringCount) + [400]
+        GeminiMockProtocol.payloads.append("{}") // consumed by the failing batch's 400 response
+        for (index, ids) in TranscriptSelection.batches(bestIDs, size: 3).enumerated() where index > 0 {
+            let id = ids[0]
+            let payload: [String: Any] = ["clips": [["start": windows[id].start, "end": windows[id].start + 30, "score": 8, "layout": "fit"]]]
+            GeminiMockProtocol.payloads.append(String(decoding: try JSONSerialization.data(withJSONObject: payload), as: UTF8.self))
+        }
+        let survived = try await GeminiSelection.select(url: URL(fileURLWithPath: "/tmp/relio-mock-missing.mov"), cues: longCues,
+            interval: (0, 1200), targetDuration: 30, count: 1, configuration: configuration, detailConcurrency: 1, session: session)
+        precondition(!survived.isEmpty, "A failed detail batch must not fail the whole run")
+        GeminiMockProtocol.payloads = []; GeminiMockProtocol.statuses = []
         let pipelineURL = FileManager.default.temporaryDirectory.appendingPathComponent("relio-cloud-pipeline-\(UUID()).mp4")
         defer { try? FileManager.default.removeItem(at: pipelineURL) }
         let pictures = AVURLAsset(url: URL(fileURLWithPath: "test-output/pictures.mov"))
@@ -181,12 +258,46 @@ final class GeminiMockProtocol: URLProtocol, @unchecked Sendable {
             "{}"
         ]
         let cloudConfiguration = GeminiConfiguration(apiKey: "test-key", model: configuration.model, session: session)
+        let savedTranscript = TranscriptBox()
         let recoveredClips = try await ShortMaker.analyze(pipelineURL, requestedDuration: 15, count: 1,
-            sourceRegion: .entireVideo, gemini: cloudConfiguration)
+            sourceRegion: .entireVideo, gemini: cloudConfiguration, onTranscript: { savedTranscript.value = $0 })
         precondition(recoveredClips.count == 1 && recoveredClips[0].speechWords.isEmpty && recoveredClips[0].fitToFrame)
         precondition(recoveredClips[0].captions.map(\.text).joined(separator: " ") == knownText)
         precondition(recoveredClips[0].analysisWarning?.contains("sentence timing") == true)
         precondition(GeminiMockProtocol.statuses.isEmpty && GeminiMockProtocol.payloads.isEmpty)
+        precondition(savedTranscript.value?.cues.map(\.text) == [knownText], "A fresh transcription must be handed back for saving")
+        // A second run on the same video reuses that transcript: the queue below has no transcription response,
+        // so any transcription request would consume the scoring reply and fail the run.
+        GeminiMockProtocol.statuses = [200, 200, 429]
+        GeminiMockProtocol.payloads = [
+            "{\"windows\":[{\"id\":0,\"score\":90}]}",
+            "{\"clips\":[{\"start\":1,\"end\":19,\"score\":9,\"layout\":\"fit\",\"title\":\"Complete story\",\"reason\":\"Hook and payoff.\"}]}",
+            "{}"
+        ]
+        GeminiMockProtocol.bodies = []
+        let reused = try await ShortMaker.analyze(pipelineURL, requestedDuration: 15, count: 1,
+            sourceRegion: .entireVideo, gemini: cloudConfiguration, videoType: .podcast, cachedTranscript: savedTranscript.value)
+        precondition(GeminiMockProtocol.bodies.count >= 2 && GeminiMockProtocol.bodies.prefix(2).allSatisfy { $0.contains("This is a podcast or interview") },
+                     "The video type's guidance must reach both the scoring and the clip-picking prompts")
+        precondition(reused.count == 1 && reused[0].captions.map(\.text).joined(separator: " ") == knownText,
+                     "A saved transcript must give the same Short without transcribing again")
+        precondition(GeminiMockProtocol.statuses.isEmpty && GeminiMockProtocol.payloads.isEmpty)
+        precondition(savedTranscript.value?.cues(covering: (0, 30)) == nil, "A transcript must not be reused for a longer range than it covers")
+        print("PASS a saved transcript is reused on the next run, with no transcription request")
+        // Auto-detect asks once, then the detected type steers both picking prompts; a bad answer means "general".
+        let windowsReply = "{\"windows\":[{\"id\":0,\"score\":90}]}"
+        let clipsReply = "{\"clips\":[{\"start\":1,\"end\":19,\"score\":9,\"layout\":\"fit\",\"title\":\"Complete story\",\"reason\":\"Hook and payoff.\"}]}"
+        for (answer, expectsPodcast) in [("podcast", true), ("cooking", false)] {
+            GeminiMockProtocol.statuses = [200, 200, 200, 429]
+            GeminiMockProtocol.payloads = ["{\"type\":\"\(answer)\"}", windowsReply, clipsReply, "{}"]
+            GeminiMockProtocol.bodies = []
+            let detected = try await ShortMaker.analyze(pipelineURL, requestedDuration: 15, count: 1, sourceRegion: .entireVideo,
+                gemini: cloudConfiguration, videoType: .auto, cachedTranscript: savedTranscript.value)
+            precondition(detected.count == 1 && GeminiMockProtocol.payloads.isEmpty, "Auto-detect must not break the run (\(answer))")
+            let steered = GeminiMockProtocol.bodies.count >= 3 && GeminiMockProtocol.bodies[1...2].allSatisfy { $0.contains("This is a podcast or interview") }
+            precondition(steered == expectsPodcast, "Detected type must steer the picks only when recognized (\(answer))")
+        }
+        print("PASS auto-detect classifies once, steers the picks, and falls back to general on an unknown answer")
         GeminiMockProtocol.statuses = [200, 429]
         GeminiMockProtocol.payloads = ["{\"segments\":[{\"text\":\"\(knownText)\",\"start\":1,\"end\":19}]}", "{}"]
         let regenerated = try await GeminiSelection.regenerateCaptions(url: audioURL, interval: (0, 20), configuration: cloudConfiguration)

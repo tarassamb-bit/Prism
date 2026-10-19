@@ -44,10 +44,21 @@ struct EditSegment: Identifiable, Codable, Hashable {
     var selectionReason: String? = nil
     var captionNotice: String? = nil
     var captionStyle: CaptionStyle? = nil
+    /// Where subtitles sit; nil is the bottom.
+    var captionPosition: CaptionPosition? = nil
+    /// Subtitle size; nil is medium.
+    var captionSize: CaptionSize? = nil
+    /// New subtitle text pops in with a quick scale bounce.
+    var captionAnimated: Bool? = nil
+    /// Two-person layout: the source's left half fills the top of the Short, its right half the bottom.
+    var splitScreen: Bool? = nil
+    /// Horizontal centers (0–1) of the top and bottom speakers in the source; nil uses the left and right quarters.
+    var splitCenters: [Double]? = nil
 
     private enum CodingKeys: String, CodingKey {
         case id, mediaID, start, duration, caption, isMuted, captionStart, captionDuration
         case fitToFrame, captions, cropZoom, cropPosition, cropKeyframes, cropTrackingVersion, speechWords, suggestedTitle, selectionReason, captionNotice, captionStyle
+        case captionPosition, captionSize, captionAnimated, splitScreen, splitCenters
     }
 
     init(id: UUID = UUID(), mediaID: UUID, start: Double = 0, duration: Double, caption: String = "",
@@ -85,8 +96,20 @@ struct EditSegment: Identifiable, Codable, Hashable {
         suggestedTitle = try values.decodeIfPresent(String.self, forKey: .suggestedTitle)
         selectionReason = try values.decodeIfPresent(String.self, forKey: .selectionReason)
         captionNotice = try values.decodeIfPresent(String.self, forKey: .captionNotice)
+        captionPosition = try values.decodeIfPresent(CaptionPosition.self, forKey: .captionPosition)
+        captionSize = try values.decodeIfPresent(CaptionSize.self, forKey: .captionSize)
+        captionAnimated = try values.decodeIfPresent(Bool.self, forKey: .captionAnimated)
         captionStyle = try values.decodeIfPresent(CaptionStyle.self, forKey: .captionStyle)
+        splitScreen = try values.decodeIfPresent(Bool.self, forKey: .splitScreen)
+        splitCenters = try values.decodeIfPresent([Double].self, forKey: .splitCenters)
     }
+}
+
+/// A Home-screen folder: a name and the project folders inside it. Projects stay where they are on disk.
+struct ProjectFolder: Codable, Identifiable, Hashable {
+    var id = UUID()
+    var name: String
+    var projectPaths: [String] = []
 }
 
 struct CropKeyframe: Codable, Hashable {
@@ -119,14 +142,119 @@ enum CaptionStyle: String, Codable, CaseIterable, Identifiable {
     case viral
     /// Retired boxed style. Kept so saved projects still decode; it renders as Simple.
     case clean
+    case highlightBox
+    case boldCaps
+    case minimal
+    case oneWord
+    case podcast
 
-    static let allCases: [CaptionStyle] = [.classic, .viral]
+    static let allCases: [CaptionStyle] = [.classic, .viral, .highlightBox, .boldCaps, .minimal, .oneWord, .podcast]
     var id: String { rawValue }
+    /// Old projects saved the retired boxed style; it is shown and drawn as Simple.
+    var resolved: CaptionStyle { self == .clean ? .classic : self }
     var title: String {
         switch self {
         case .classic, .clean: "Simple"
         case .viral: "Viral highlight"
+        case .highlightBox: "Highlight box"
+        case .boldCaps: "Bold caps"
+        case .minimal: "Minimal"
+        case .oneWord: "One word"
+        case .podcast: "Podcast"
         }
+    }
+    var detail: String {
+        switch self {
+        case .classic, .clean: "White text with a black outline."
+        case .viral: "Each spoken word turns yellow."
+        case .highlightBox: "The spoken word sits on a yellow box."
+        case .boldCaps: "Big all-caps text, three words at a time."
+        case .minimal: "Smaller text on a soft dark band."
+        case .oneWord: "One big word at a time."
+        case .podcast: "Soft-shadowed text; the spoken word turns green."
+        }
+    }
+    /// Styles that follow each spoken word need word timing; without it they fall back to whole phrases.
+    var usesWordTiming: Bool { [.viral, .highlightBox, .oneWord, .podcast].contains(self) }
+}
+
+enum CaptionPosition: String, Codable, CaseIterable, Identifiable {
+    case top, middle, bottom
+    var id: String { rawValue }
+    var title: String { rawValue.capitalized }
+    /// Bottom edge of the subtitle layer in the 1080×1920 frame (origin at the bottom).
+    var y: CGFloat { switch self { case .top: 1460; case .middle: 855; case .bottom: 330 } }
+}
+
+enum CaptionSize: String, Codable, CaseIterable, Identifiable {
+    case small, medium, large
+    var id: String { rawValue }
+    var title: String { rawValue.capitalized }
+    var scale: CGFloat { switch self { case .small: 0.8; case .medium: 1; case .large: 1.25 } }
+}
+
+/// What kind of video a Short is cut from. It steers what the AI looks for, the layout and the default subtitles.
+enum VideoType: String, Codable, CaseIterable, Identifiable {
+    case auto, general, informational, podcast, tutorial, vlog, gaming
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .auto: "Auto-detect"
+        case .general: "Any video"
+        case .informational: "Informational / explainer"
+        case .podcast: "Podcast / interview"
+        case .tutorial: "Tutorial / screen"
+        case .vlog: "Vlog / talking head"
+        case .gaming: "Gaming / stream"
+        }
+    }
+    var detail: String {
+        switch self {
+        case .auto: "Prism decides from what is said in the video."
+        case .general: "No special rules. Good for mixed content."
+        case .informational: "Facts and explanations. Each Short keeps one idea with its setup and payoff."
+        case .podcast: "Two people talking. Split screen: one person on top, one on the bottom, captions in the middle."
+        case .tutorial: "Screen recordings and lessons. The whole screen stays visible."
+        case .vlog: "One person talking to camera. The crop follows them."
+        case .gaming: "Gameplay and streams. The whole game stays visible."
+        }
+    }
+    var icon: String {
+        switch self {
+        case .auto: "sparkles"
+        case .general: "film"
+        case .informational: "lightbulb"
+        case .podcast: "person.2"
+        case .tutorial: "display"
+        case .vlog: "person.crop.square"
+        case .gaming: "gamecontroller"
+        }
+    }
+    /// Screen recordings and gameplay lose their edges in a vertical crop, so they always show the whole frame.
+    var forcesFit: Bool { self == .tutorial || self == .gaming }
+    /// Added to the AI's instructions: what makes a strong Short for this kind of video.
+    var selectionGuidance: String {
+        switch self {
+        case .auto, .general: ""
+        case .informational: "This is an informational or explainer video. Favor one clear fact, insight or explanation per clip, with the setup that makes it understandable and its payoff. Prefer the 'track' layout on the speaker."
+        case .podcast: "This is a podcast or interview. Favor strong opinions, surprising answers, complete stories and quotable lines; keep the question when the answer needs it. Prefer the 'track' layout so the speaker stays in frame."
+        case .tutorial: "This is a tutorial or screen recording. Favor one complete step, tip or result per clip, including what it achieves. Use the 'fit' layout so the whole screen stays readable."
+        case .vlog: "This is a vlog or talking-head video. Favor clear hooks, personal moments, reactions and payoffs told to camera. Prefer the 'track' layout on the person."
+        case .gaming: "This is gameplay or a stream. Favor wins, fails, clutch plays, funny reactions and hype moments, with enough lead-up to understand them. Use the 'fit' layout so the game and facecam stay visible."
+        }
+    }
+}
+
+/// Gemini's sentence transcript of one source range.
+struct SentenceTranscript: Codable, Sendable {
+    var start: Double
+    var end: Double
+    var cues: [TimedCaption]
+
+    /// The cues inside `interval`, or nil when this transcript doesn't cover all of it.
+    func cues(covering interval: (start: Double, end: Double)) -> [TimedCaption]? {
+        guard start <= interval.start + 0.01, end >= interval.end - 0.01 else { return nil }
+        return cues.filter { $0.start >= interval.start - 0.001 && $0.start + $0.duration <= interval.end + 0.001 }
     }
 }
 
@@ -139,6 +267,8 @@ struct ProjectData: Codable {
     var created: Date = .now
     /// A name the person chose; older projects have none.
     var title: String? = nil
+    /// Cloud sentence transcripts by media ID, so later runs on the same video skip transcription.
+    var transcripts: [String: SentenceTranscript]? = nil
 
     /// What people see: their chosen name, else the first Short's title, else the video's name, else the dated folder name.
     var displayTitle: String {

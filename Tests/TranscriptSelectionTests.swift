@@ -46,5 +46,27 @@ import Foundation
             cues: [.init(text: "previous", start: 8, duration: 1.8), .init(text: "next", start: 15.2, duration: 2)], interval: (0, 20))
         precondition(abs(padded.start - 9.9) < 0.001 && abs(padded.start + padded.duration - 15.1) < 0.001)
         print("PASS transcript coverage, region bounds, balanced batches, tail scoring, model failure, overlap filtering and phrase cuts")
+        let sentences = [TimedCaption(text: "A.", start: 0, duration: 10), TimedCaption(text: "B.", start: 10, duration: 10),
+                         TimedCaption(text: "C.", start: 20, duration: 10), TimedCaption(text: "D.", start: 30, duration: 15)]
+        func whole(_ start: Double, _ duration: Double, max: Double = 30) -> (Double, Double) {
+            let range = TranscriptSelection.completeSentences(start: start, duration: duration, cues: sentences, interval: (0, 100),
+                                                             minDuration: 10, maxDuration: max)
+            return (range.start, range.start + range.duration)
+        }
+        precondition(whole(10, 16) == (10, 30), "An end inside a sentence must finish that sentence")
+        precondition(whole(2, 31, max: 40) == (0, 30), "A start moves back to its sentence; an end far from its sentence's end steps back")
+        precondition(whole(10, 10) == (10, 20), "Cuts already on sentence boundaries must not move")
+        precondition(whole(15, 25) == (20, 45), "A start deep inside a sentence moves to the next one")
+        precondition(whole(0, 28, max: 29) == (0, 20), "Finishing the sentence must not exceed the maximum length")
+        precondition(whole(0, 5) == (0, 10), "A range ending inside the first sentence finishes it")
+        precondition(whole(0, 5, max: 8) == (0, 5), "When finishing would be too long and no earlier sentence fits, the end stays")
+        precondition(whole(25, 10) == (20, 30), "Edges never stay mid-sentence while a sentence-complete range fits the limits")
+        let spoken = [TimedCaption(text: "Okay, so.", start: 0, duration: 2), TimedCaption(text: "Nobody tells you this trick.", start: 2, duration: 20),
+                      TimedCaption(text: "It saved me hours.", start: 22, duration: 10), TimedCaption(text: "Thanks for watching!", start: 32, duration: 2)]
+        let trimmed = TranscriptSelection.trimmedFiller(start: 0, duration: 34, cues: spoken, minDuration: 20)
+        precondition(trimmed.start == 2 && trimmed.start + trimmed.duration == 32, "Filler-only openings and sign-offs are trimmed")
+        let kept = TranscriptSelection.trimmedFiller(start: 0, duration: 34, cues: spoken, minDuration: 33)
+        precondition(kept.start == 0 && kept.duration == 34, "Filler stays when trimming would make the clip too short")
+        print("PASS sentence-complete cuts: ends finish their sentence or step back, starts move to a sentence start, length limits hold")
     }
 }

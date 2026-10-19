@@ -24,6 +24,9 @@ iconutil -c icns dist/Prism.iconset -o $app/Contents/Resources/Prism.icns
 xattr -cr $app
 if [[ -n "${RELIO_SIGNING_IDENTITY:-}" ]]; then
   codesign --force --options runtime --timestamp --sign "$RELIO_SIGNING_IDENTITY" $app
+elif security find-identity -p codesigning | grep -q "Prism Local Signing"; then
+  # Stable local identity (scripts/create-signing-identity.sh) keeps Keychain's "Always Allow" across rebuilds.
+  codesign --force --sign "Prism Local Signing" $app
 else
   codesign --force --sign - $app
 fi

@@ -39,9 +39,18 @@ final class AppModel {
     var project: ProjectData?
     var message = "Create a project to begin."
     var isBusy = false
-    var generationProgress: Double? = nil
+    var generationProgress: Double? = nil {
+        didSet { if oldValue == nil, generationProgress != nil { generationStartedAt = .now } }
+    }
+    var generationStartedAt = Date.now
     var generationStage = ""
+    /// Why the last Shorts run produced nothing; shown as a blocking popup in the editor.
+    var generationError: String?
     private var generationTask: Task<Void, Never>?
+    /// Export uses the progress popup too, but its Cancel keeps you in the editor.
+    var isExporting = false
+    /// Set when an export finishes; shown as a popup with a Finder shortcut.
+    var exportSummary: String?
     func cancelGeneration() {
         guard generationTask != nil else { return }
         generationStage = "Cancelling…"
@@ -80,6 +89,8 @@ final class AppModel {
     var shortDuration = 30.0
     var shortSourceRegion = ShortMaker.SourceRegion.entireVideo
     var shortCaptionStyle: CaptionStyle = .classic
+    /// Chosen after captions, so it never overrides the caption style picked on the step before.
+    var shortVideoType: VideoType = .auto
     var customStartMinutes = "0"
     var customEndMinutes = ""
     var shortsSource: MediaItem? {
@@ -261,6 +272,7 @@ final class AppModel {
                 }
             }
             editHistory = []; exportedFiles = []; chatMessages = []; store = s; project = p; projectURL = url; selection = p.media.first?.id
+            lastSavedAt = (try? url.appendingPathComponent("project.sqlite").resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
             UserDefaults.standard.set(url.path, forKey: "lastProject")
             remember(url)
             screen = .editor
@@ -292,7 +304,77 @@ final class AppModel {
         recentProjectPaths = paths
         UserDefaults.standard.set(paths, forKey: "recentProjects")
     }
-    func save() throws { if let project { try store?.save(project, key: "project") } }
+    /// When the open project last reached disk; the editor header shows it so saving is visible.
+    var lastSavedAt: Date?
+    func save() throws {
+        guard let project else { return }
+        try store?.save(project, key: "project")
+        lastSavedAt = .now
+    }
+
+    /// Keeps the cloud transcript with the project; "Create more Shorts" then skips uploading and transcribing again.
+    /// It's saved straight away, so it survives a later cancel or failure in the same run.
+    private func storeTranscript(_ transcript: SentenceTranscript, for mediaID: UUID) {
+        guard project?.media.contains(where: { $0.id == mediaID }) == true else { return }
+        var saved = project?.transcripts ?? [:]
+        if let existing = saved[mediaID.uuidString], existing.end - existing.start > transcript.end - transcript.start { return }
+        saved[mediaID.uuidString] = transcript
+        project?.transcripts = saved
+        try? save()
+    }
+
+    /// The same video's cloud transcript from another project (same name, length, size and file size),
+    /// so starting over with a video you used before skips uploading and transcribing it again.
+    private func transcriptFromOtherProjects(matching video: MediaItem) -> SentenceTranscript? {
+        func fileSize(_ path: String) -> Int? { (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int) ?? nil }
+        let size = fileSize(video.path)
+        var best: SentenceTranscript?
+        for path in recentProjectPaths where path != projectURL?.path {
+            guard let other = try? ProjectStore(root: URL(fileURLWithPath: path)).load(ProjectData.self, key: "project") else { continue }
+            for media in other.media where media.name == video.name && abs(media.duration - video.duration) < 0.01
+                && media.width == video.width && media.height == video.height && fileSize(media.path) == size {
+                guard let transcript = other.transcripts?[media.id.uuidString] else { continue }
+                if transcript.end - transcript.start > (best.map { $0.end - $0.start } ?? -1) { best = transcript }
+            }
+        }
+        return best
+    }
+
+    var projectFolders: [ProjectFolder] = (UserDefaults.standard.data(forKey: "projectFolders"))
+        .flatMap { try? JSONDecoder().decode([ProjectFolder].self, from: $0) } ?? []
+    private func saveFolders() {
+        UserDefaults.standard.set(try? JSONEncoder().encode(projectFolders), forKey: "projectFolders")
+    }
+    @discardableResult
+    func createFolder(named name: String) -> UUID? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let folder = ProjectFolder(name: String(trimmed.prefix(60)))
+        projectFolders.append(folder)
+        saveFolders()
+        return folder.id
+    }
+    func renameFolder(_ id: UUID, to name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let index = projectFolders.firstIndex(where: { $0.id == id }) else { return }
+        projectFolders[index].name = String(trimmed.prefix(60))
+        saveFolders()
+    }
+    /// Removes only the folder; its projects go back to Home.
+    func deleteFolder(_ id: UUID) {
+        projectFolders.removeAll { $0.id == id }
+        saveFolders()
+    }
+    /// Puts a project in a folder (nil takes it out); a project is in at most one folder.
+    func moveProject(_ path: String, toFolder id: UUID?) {
+        // Drops can carry any text; only known projects belong in folders.
+        guard id == nil || recentProjectPaths.contains(path) else { return }
+        for index in projectFolders.indices { projectFolders[index].projectPaths.removeAll { $0 == path } }
+        if let id, let index = projectFolders.firstIndex(where: { $0.id == id }) {
+            projectFolders[index].projectPaths.insert(path, at: 0)
+        }
+        saveFolders()
+    }
 
     /// Bumped when a project changes from Home, so its card reloads.
     var projectListRevision = 0
@@ -321,13 +403,14 @@ final class AppModel {
         guard !isBusy else { return }
         if projectURL?.path == path {
             player?.pause(); player = nil
-            project = nil; store = nil; projectURL = nil; editHistory = []; previewSegment = nil
+            project = nil; store = nil; projectURL = nil; editHistory = []; previewSegment = nil; lastSavedAt = nil
             UserDefaults.standard.removeObject(forKey: "lastProject")
         }
         do {
             try FileManager.default.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: nil)
             recentProjectPaths.removeAll { $0 == path }
             UserDefaults.standard.set(recentProjectPaths, forKey: "recentProjects")
+            moveProject(path, toFolder: nil)
             message = "Moved the project to the Trash."
         } catch { message = "Could not delete project: \(error.localizedDescription)" }
     }
@@ -373,17 +456,9 @@ final class AppModel {
             try? FileManager.default.createDirectory(at: mediaDirectory, withIntermediateDirectories: true)
             let copiedURL = uniqueDestination(for: url, in: mediaDirectory)
             do {
+                // copyItem clones on APFS: instant and no extra disk space when the video is on the same drive.
                 try await Task.detached(priority: .userInitiated) {
-                    let input = try FileHandle(forReadingFrom: url)
-                    defer { try? input.close() }
-                    guard FileManager.default.createFile(atPath: copiedURL.path, contents: nil) else {
-                        throw CocoaError(.fileWriteUnknown)
-                    }
-                    let output = try FileHandle(forWritingTo: copiedURL)
-                    defer { try? output.close() }
-                    while let data = try input.read(upToCount: 1024 * 1024), !data.isEmpty {
-                        try output.write(contentsOf: data)
-                    }
+                    try FileManager.default.copyItem(at: url, to: copiedURL)
                 }.value
             } catch {
                 try? FileManager.default.removeItem(at: copiedURL)
@@ -454,7 +529,7 @@ final class AppModel {
         selection = video.id
         player = nil
         isPreviewLoading = true
-        if segment.cropTrackingVersion != SubjectFramer.version {
+        if segment.cropTrackingVersion != SubjectFramer.version && segment.splitScreen != true {
             isBusy = true
             subjectTrackingRevision = revision
             message = "Tracking the main visual subject…"
@@ -510,12 +585,22 @@ final class AppModel {
         let configuration: GeminiConfiguration?
         if useGemini {
             let key = geminiAPIKey()
-            guard !key.isEmpty else { message = "Add and save your Gemini key in Settings first."; return }
+            guard !key.isEmpty else {
+                message = "Add and save your Gemini key in Settings first."
+                generationError = "Gemini cloud is turned on, but no API key is saved. Add your key in Settings, or switch to on-device AI."
+                return
+            }
             configuration = .init(apiKey: key, model: geminiModel)
         } else { configuration = nil }
-        isBusy = true; generationProgress = 0; generationStage = "Preparing video"; message = "Preparing video analysis…"
+        isBusy = true; generationProgress = 0; generationError = nil; generationStage = "Preparing video"; message = "Preparing video analysis…"
         let sourceURL = URL(fileURLWithPath: video.path)
         let usedRanges = (project?.segments ?? []).filter { $0.mediaID == video.id }.map { SourceInterval(start: $0.start, end: $0.start + $0.duration) }
+        var savedTranscript = project?.transcripts?[video.id.uuidString]
+        if savedTranscript == nil, configuration != nil, let earlier = transcriptFromOtherProjects(matching: video) {
+            savedTranscript = earlier
+            storeTranscript(earlier, for: video.id)
+        }
+        let videoType = shortVideoType
         generationTask = Task {
             do {
                 let results = try await ShortMaker.analyze(
@@ -526,6 +611,11 @@ final class AppModel {
                     customStart: customStart, customEnd: customEnd,
                     excluding: usedRanges,
                     gemini: configuration,
+                    videoType: videoType,
+                    cachedTranscript: savedTranscript,
+                    onTranscript: { transcript in
+                        Task { @MainActor in self.storeTranscript(transcript, for: video.id) }
+                    },
                     progress: { completed, total in
                         Task { @MainActor in
                             if completed >= total {
@@ -547,27 +637,40 @@ final class AppModel {
                 )
                 try Task.checkCancellation()
                 var candidates: [EditSegment] = results.map {
-                    .init(mediaID: video.id, start: $0.start, duration: $0.duration, caption: $0.caption,
+                    var segment = EditSegment(mediaID: video.id, start: $0.start, duration: $0.duration, caption: $0.caption,
                           fitToFrame: $0.fitToFrame, captions: $0.captions, cropKeyframes: $0.cropKeyframes, cropTrackingVersion: SubjectFramer.version,
                           speechWords: $0.speechWords, suggestedTitle: $0.suggestedTitle, selectionReason: $0.selectionReason,
                           captionNotice: $0.analysisWarning, captionStyle: shortCaptionStyle)
+                    // Only an explicit Podcast pick splits the frame; an auto-detected podcast may have one person on camera.
+                    if videoType == .podcast { segment.splitScreen = true; segment.captionPosition = .middle }
+                    return segment
                 }
-                // Viral highlights need word timing; Gemini's often fails verification, so measure it on this Mac.
-                if configuration != nil, shortCaptionStyle == .viral {
+                // Word-following styles need word timing; Gemini's often fails verification, so measure it on this Mac.
+                if configuration != nil, shortCaptionStyle.usesWordTiming {
                     for index in candidates.indices where candidates[index].speechWords?.isEmpty != false && candidates[index].captions?.isEmpty == false {
                         try Task.checkCancellation()
                         generationStage = "Timing words on this Mac · Short \(index + 1) of \(candidates.count)"
-                        let local = await ShortMaker.captions(for: sourceURL, start: candidates[index].start, duration: candidates[index].duration,
-                                                              languageHint: candidates[index].captions?.map(\.text).joined(separator: " "))
-                        guard !local.words.isEmpty else { continue }
-                        candidates[index].captions = local.cues
-                        candidates[index].speechWords = local.words
+                        guard let timed = await ShortMaker.retimedOnDevice(
+                            url: sourceURL, start: candidates[index].start, duration: candidates[index].duration, sourceDuration: video.duration,
+                            languageHint: candidates[index].captions?.map(\.text).joined(separator: " ")) else { continue }
+                        // The cut moves onto whole words, as in the Gemini path; Gemini's end can fall inside a word.
+                        candidates[index].start = timed.start
+                        candidates[index].duration = timed.duration
+                        candidates[index].captions = timed.cues
+                        candidates[index].speechWords = timed.words
                         candidates[index].captionNotice = nil
                     }
                 }
+                for index in candidates.indices where candidates[index].splitScreen == true {
+                    try Task.checkCancellation()
+                    generationStage = "Finding both speakers · Short \(index + 1) of \(candidates.count)"
+                    candidates[index].splitCenters = await ShortMaker.findSplitCenters(sourceURL, start: candidates[index].start, duration: candidates[index].duration)
+                }
+                try Task.checkCancellation()
                 let fresh = try appendGeneratedShorts(candidates)
                 guard !fresh.isEmpty else {
                     message = "No new distinct moments were found in this range. Your existing clips were kept. Try another region or length."
+                    generationError = message
                     generationProgress = nil; generationTask = nil; isBusy = false
                     return
                 }
@@ -580,6 +683,7 @@ final class AppModel {
                 selectPreview(fresh.first?.id)
             } catch {
                 message = Task.isCancelled ? "Generation cancelled. Your existing clips were kept." : "Analysis failed: \(error.localizedDescription)"
+                if !Task.isCancelled { generationError = error.localizedDescription }
             }
             generationProgress = nil
             generationTask = nil
@@ -604,9 +708,19 @@ final class AppModel {
         editHistory.append(previous)
         return fresh
     }
-    func export() {
+    /// A Short's title as a file name: no path or Finder-unsafe characters, at most 80 characters.
+    nonisolated static func exportFileName(title: String?) -> String? {
+        let cleaned = (title ?? "").components(separatedBy: CharacterSet(charactersIn: "/\\:*?\"<>|").union(.newlines).union(.controlCharacters))
+            .joined(separator: " ")
+            .split(separator: " ", omittingEmptySubsequences: true).joined(separator: " ")
+            .trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+        return cleaned.isEmpty ? nil : String(cleaned.prefix(80))
+    }
+
+    /// Exports every Short, or only the one with `id`.
+    func export(only id: UUID? = nil) {
         guard !isBusy else { return }
-        guard let segments = project?.segments, !segments.isEmpty else { return }
+        guard let segments = project?.segments.filter({ id == nil || $0.id == id }), !segments.isEmpty else { return }
         guard let projectURL else { return }
         let media = project?.media ?? []
         let projectName = project?.name ?? "Prism"
@@ -614,13 +728,17 @@ final class AppModel {
         try? FileManager.default.createDirectory(at: exports, withIntermediateDirectories: true)
         exportedFiles = []
         isBusy = true; message = segments.count == 1 ? "Rendering Short locally…" : "Rendering \(segments.count) Shorts locally…"
-        Task {
+        isExporting = true; generationProgress = 0; generationStage = "Preparing export"
+        generationTask = Task {
             do {
                 var exportedCount = 0
                 for (index, originalSegment) in segments.enumerated() {
+                    try Task.checkCancellation()
+                    generationProgress = Double(index) / Double(segments.count)
+                    generationStage = "Exporting Short \(index + 1) of \(segments.count)"
                     var segment = originalSegment
                     guard let video = media.first(where: { $0.id == segment.mediaID }) else { throw ShortMaker.Failure.noVideo }
-                    if segment.cropTrackingVersion != SubjectFramer.version {
+                    if segment.cropTrackingVersion != SubjectFramer.version && segment.splitScreen != true {
                         message = "Tracking subject in Short \(index + 1) of \(segments.count)…"
                         segment.cropKeyframes = await ShortMaker.analyzeSubjectPath(
                             URL(fileURLWithPath: video.path), start: segment.start, duration: segment.duration, zoom: segment.cropZoom ?? 1.08, useSemanticModel: !useGemini
@@ -634,20 +752,23 @@ final class AppModel {
                     }
                     message = "Rendering Short \(index + 1) of \(segments.count)…"
                     let suffix = segments.count == 1 ? "" : " \(index + 1)"
-                    let destination = uniqueDestination(for: URL(fileURLWithPath: "\(projectName) Short\(suffix).mp4"), in: exports)
+                    let destination = uniqueDestination(for: URL(fileURLWithPath: "\(Self.exportFileName(title: segment.suggestedTitle) ?? "\(projectName) Short\(suffix)").mp4"), in: exports)
                     try await ShortMaker.export(source: URL(fileURLWithPath: video.path), segment: segment, destination: destination)
                     exportedFiles.append(destination)
                     exportedCount += 1
                 }
                 message = segments.count == 1 ? "Exported Short to Exports." : "Exported \(exportedCount) Shorts to Exports."
+                exportSummary = message
             }
             catch {
                 let completed = exportedFiles.count
-                message = completed == 0
+                message = Task.isCancelled
+                    ? "Export cancelled. \(completed) of \(segments.count) Shorts finished and are in Exports."
+                    : completed == 0
                     ? "Export failed: \(error.localizedDescription)"
                     : "Export stopped after \(completed) of \(segments.count) Shorts. Completed files are in Exports. \(error.localizedDescription)"
             }
-            isBusy = false
+            isBusy = false; isExporting = false; generationProgress = nil; generationTask = nil
         }
     }
     func revealExports() {
@@ -717,7 +838,8 @@ final class AppModel {
         project?.segments = [.init(mediaID: video.id, duration: min(video.duration, 30))]
         return true
     }
-    private func applyEdit(_ change: (inout EditSegment, MediaItem) -> String?) -> String? {
+    /// `captionsOnly` edits swap the caption overlay in place, so the player keeps its playhead.
+    private func applyEdit(captionsOnly: Bool = false, _ change: (inout EditSegment, MediaItem) -> String?) -> String? {
         guard ensureSegment(),
               let index = project?.segments.firstIndex(where: { $0.id == previewShortID }) ?? project?.segments.indices.first,
               var segment = project?.segments[index],
@@ -725,8 +847,12 @@ final class AppModel {
         rememberEdit()
         guard let reply = change(&segment, video) else { editHistory.removeLast(); return nil }
         project?.segments[index] = segment
-        do { try save(); selectPreview(segment.id); message = reply; return reply }
-        catch {
+        do {
+            try save()
+            if captionsOnly && player != nil && previewSegment?.id == segment.id { previewSegment = segment }
+            else { selectPreview(segment.id) }
+            message = reply; return reply
+        } catch {
             if let previous = editHistory.popLast() { project?.segments = previous }
             return "Could not save the edit: \(error.localizedDescription)"
         }
@@ -735,9 +861,35 @@ final class AppModel {
         guard !isBusy else { return }
         if let reply = applyEdit({ segment, _ in
             segment.fitToFrame = fit
+            segment.splitScreen = nil
             if fit { segment.cropZoom = 1 }
             return fit ? "The full source frame will be visible in the vertical video." : "The vertical crop follows the saved focus path."
         }) { message = reply }
+    }
+
+    func setSplitScreen() {
+        guard !isBusy, let segment = activeSegment,
+              let video = project?.media.first(where: { $0.id == segment.mediaID }) else { return }
+        guard segment.splitCenters == nil else {
+            _ = applyEdit { segment, _ in
+                segment.splitScreen = true; segment.captionPosition = .middle
+                return "Split screen: left person on top, right person on the bottom, captions in the middle."
+            }
+            return
+        }
+        isBusy = true
+        message = "Finding both speakers…"
+        Task {
+            let centers = await ShortMaker.findSplitCenters(URL(fileURLWithPath: video.path), start: segment.start, duration: segment.duration)
+            isBusy = false
+            guard previewShortID == segment.id else { return }
+            _ = applyEdit { segment, _ in
+                segment.splitScreen = true; segment.captionPosition = .middle; segment.splitCenters = centers
+                return centers == nil
+                    ? "Split screen on. Couldn't find two faces, so the left half is on top and the right half on the bottom."
+                    : "Split screen: each speaker is centered in their half, captions in the middle."
+            }
+        }
     }
 
     func holdFramingAtCenter() {
@@ -853,16 +1005,65 @@ final class AppModel {
 
     func setSelectedCaptionStyle(_ style: CaptionStyle) {
         guard !isBusy, activeSegment != nil else { return }
-        if let reply = applyEdit({ segment, _ in
+        if let reply = applyEdit(captionsOnly: true, { segment, _ in
             segment.captionStyle = style
-            return style == .viral ? "Viral captions: each spoken word turns yellow." : "Simple captions applied."
+            return "\(style.title) subtitles applied."
         }) { message = reply }
+        // Word-following styles need word timing; measure it now rather than waiting for the person to press Transcribe.
+        if style.usesWordTiming, let segment = activeSegment, segment.speechWords?.isEmpty != false, segment.captions?.isEmpty == false {
+            timeSelectedShortWords()
+        }
+    }
+
+    /// Subtitle placement, size and pop-in for the selected Short; nil leaves that setting unchanged.
+    func setSelectedCaptionLayout(position: CaptionPosition? = nil, size: CaptionSize? = nil, animated: Bool? = nil) {
+        guard !isBusy, activeSegment != nil else { return }
+        if let reply = applyEdit(captionsOnly: true, { segment, _ in
+            if let position { segment.captionPosition = position }
+            if let size { segment.captionSize = size }
+            if let animated { segment.captionAnimated = animated }
+            return "Subtitle layout saved."
+        }) { message = reply }
+    }
+
+    /// Measures word timing on this Mac for the selected Short and moves its cuts onto whole words.
+    func timeSelectedShortWords() {
+        guard !isBusy, let segment = activeSegment,
+              let video = project?.media.first(where: { $0.id == segment.mediaID }) else { return }
+        let segmentID = segment.id
+        isBusy = true
+        message = "Timing words on this Mac for yellow highlights…"
+        Task {
+            let timed = await ShortMaker.retimedOnDevice(url: URL(fileURLWithPath: video.path), start: segment.start, duration: segment.duration,
+                                                         sourceDuration: video.duration,
+                                                         languageHint: segment.captions?.map(\.text).joined(separator: " "))
+            isBusy = false
+            guard let index = project?.segments.firstIndex(where: { $0.id == segmentID }) else { return }
+            guard let timed else {
+                message = "Couldn't time the words on this Mac, so captions show without highlights. Try Transcribe in the Captions tab."
+                return
+            }
+            editHistory.append(project?.segments ?? [])
+            project?.segments[index].start = timed.start
+            project?.segments[index].duration = timed.duration
+            project?.segments[index].captions = timed.cues
+            project?.segments[index].speechWords = timed.words
+            project?.segments[index].captionNotice = nil
+            do {
+                try save()
+                if previewShortID == segmentID { selectPreview(segmentID) }
+                message = "Word timing ready. Spoken words now turn yellow."
+            } catch {
+                if let previous = editHistory.popLast() { project?.segments = previous }
+                message = "Could not save word timing: \(error.localizedDescription)"
+            }
+        }
     }
 
     /// Replaces caption wording only; timings stay. An empty line removes that caption.
     func updateSelectedCaptionTexts(_ texts: [String]) {
         guard !isBusy, let cues = activeSegment?.captions, texts.count == cues.count else { return }
-        if let reply = applyEdit({ segment, _ in
+        if let reply = applyEdit(captionsOnly: true, { segment, _ in
             segment.captions = zip(cues, texts).compactMap { cue, text in
                 let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
                 return trimmed.isEmpty ? nil : TimedCaption(text: trimmed, start: cue.start, duration: cue.duration)
@@ -1010,6 +1211,20 @@ final class AppModel {
             editHistory.removeLast()
             message = "Could not save clip: \(error.localizedDescription)"
         }
+    }
+
+    var previewLength: Double { activeSegment?.duration ?? project?.media.first(where: { $0.id == selection })?.duration ?? 0 }
+
+    func togglePlayback() {
+        guard let player else { return }
+        if player.rate != 0 { player.pause(); return }
+        if player.currentTime().seconds >= previewLength - 0.1 { seekPreview(to: 0) }
+        player.play()
+    }
+
+    func seekPreview(by seconds: Double) {
+        guard let player else { return }
+        seekPreview(to: player.currentTime().seconds + seconds)
     }
 
     func seekPreview(to seconds: Double) {
@@ -1305,8 +1520,14 @@ struct ContentView: View {
     @State private var isDropTarget = false
     @State private var sidebarCollapsed = false
     @State private var choosingCaptions = false
+    @State private var choosingType = false
     @State private var showAllProjects = false
     @State private var showUnfinishedProjects = false
+    @State private var openFolderID: UUID?
+    @State private var folderNamePrompt: FolderNamePrompt?
+    @State private var folderNameText = ""
+    @State private var dropTargetFolder: UUID?
+    private struct FolderNamePrompt: Identifiable { let id = UUID(); var folderID: UUID?; var movingProject: String? }
     @State private var projectShortCounts: [String: Int] = [:]
     @State private var renameProjectPath: String?
     @State private var renameText = ""
@@ -1315,6 +1536,7 @@ struct ContentView: View {
     @AppStorage(PrismAppearance.storageKey) var appearance = PrismAppearance.dark
     @AppStorage("editor.leftSidebarWidth") var leftSidebarWidth = 248.0
     @AppStorage("editor.rightSidebarWidth") var rightSidebarWidth = 282.0
+    @AppStorage("editor.timelineHeight") var timelineHeight = 278.0
     @AppStorage("system.resourceRefreshSeconds") private var resourceRefreshSeconds = 60.0
     @State private var selectedSettingsCategory: SettingsCategory = .aiCloud
     private let resourceRefreshOptions: [ResourceRefreshOption] = [
@@ -1344,6 +1566,11 @@ struct ContentView: View {
                 expandedPlayer(player)
             }
         }
+        .overlay {
+            if model.screen == .editor, let progress = model.generationProgress { generationOverlay(progress) }
+            else if model.screen == .editor, let error = model.generationError { generationErrorOverlay(error) }
+            else if model.screen == .editor, let summary = model.exportSummary { exportDoneOverlay(summary) }
+        }
         .tint(Prism.accent)
         .animation(.easeInOut(duration: 0.2), value: sidebarCollapsed)
     }
@@ -1368,32 +1595,22 @@ struct ContentView: View {
             if sidebarCollapsed {
                 Button { sidebarCollapsed = false } label: {
                     Image(systemName: "sidebar.right").font(Prism.text(18)).frame(maxWidth: .infinity)
-                }.buttonStyle(.plain).pointerFeedback().help("Expand sidebar")
+                }.buttonStyle(.prismLink).pointerFeedback().help("Expand sidebar")
             } else {
                 HStack(spacing: 10) {
                     PrismMark().frame(height: 24)
                     Text("Prism").font(Prism.display(24)).tracking(-0.5)
                     Spacer()
-                    Button { sidebarCollapsed = true } label: { Image(systemName: "sidebar.left") }
-                        .buttonStyle(.plain).pointerFeedback().foregroundStyle(Prism.textSecondary).help("Collapse sidebar")
+                    Button { sidebarCollapsed = true } label: { Image(systemName: "sidebar.left") }.buttonStyle(.prismIcon)
+                        .pointerFeedback().foregroundStyle(Prism.textSecondary).help("Collapse sidebar")
                 }
         Text(model.useGemini ? "Your video editor · Cloud AI" : "Your video editor · On-device AI").font(Prism.text(12)).foregroundStyle(Prism.textSecondary)
             }
             Divider().padding(.vertical, 8)
             sidebarButton("Home", icon: "house.fill", selected: model.screen == .home) { model.screen = .home }
             sidebarButton("Create Shorts", icon: "plus.square.fill", selected: model.screen == .importSource, prominent: true) { model.startLongVideoToShort() }
-            if let project = model.project {
+            if model.project != nil {
                 sidebarButton("Editor", icon: "film.stack.fill", selected: model.screen == .editor) { model.screen = .editor }
-                if !sidebarCollapsed {
-                    Divider()
-                    Text("Media · \(project.media.count)").font(Prism.text(12, .medium)).foregroundStyle(Prism.textSecondary)
-                    ForEach(project.media) { item in
-                        Button { model.selection = item.id; model.selectPreview(nil) } label: {
-                            HStack { Image(systemName: "film"); Text(item.name).lineLimit(1) }.frame(maxWidth: .infinity, alignment: .leading)
-                        }.buttonStyle(.plain).pointerFeedback()
-                    }
-                    Button("＋  Import video") { model.importVideo() }.pointerFeedback()
-                }
             }
             Spacer()
             sidebarButton("Settings", icon: "gearshape.fill", selected: model.screen == .settings) { model.screen = .settings }
@@ -1688,14 +1905,37 @@ struct ContentView: View {
                     .foregroundStyle(Prism.ink)
                     .background(Prism.action, in: RoundedRectangle(cornerRadius: 16))
                     .pointerFeedback()
+                    .keyboardShortcut("n", modifiers: .command)
+                    .help("Start creating · ⌘N")
                 }
 
                 // Uploads that never got Shorts are kept but tucked away; until counts load, every project shows.
-                let finished = model.recentProjectPaths.filter { (projectShortCounts[$0] ?? 1) > 0 }
-                let unfinished = model.recentProjectPaths.filter { projectShortCounts[$0] == 0 }
+                let openFolder = model.projectFolders.first { $0.id == openFolderID }
+                let foldered = Set(model.projectFolders.flatMap(\.projectPaths))
+                let shown = openFolder.map { folder in model.recentProjectPaths.filter { folder.projectPaths.contains($0) } }
+                    ?? model.recentProjectPaths.filter { !foldered.contains($0) }
+                let finished = shown.filter { (projectShortCounts[$0] ?? 1) > 0 }
+                let unfinished = shown.filter { projectShortCounts[$0] == 0 }
                 HStack(alignment: .firstTextBaseline) {
-                    Text("Projects").font(Prism.display(22))
+                    if let openFolder {
+                        Button { openFolderID = nil } label: { Label("Projects", systemImage: "chevron.left") }
+                            .buttonStyle(.prismGhost).keyboardShortcut(.cancelAction)
+                            .dropDestination(for: String.self) { paths, _ in
+                                paths.forEach { model.moveProject($0, toFolder: nil) }; return !paths.isEmpty
+                            }
+                            .help("Back to all projects · drop a project here to take it out of the folder")
+                        Text(openFolder.name).font(Prism.display(22))
+                    } else {
+                        Text("Projects").font(Prism.display(22))
+                    }
                     Spacer()
+                    if openFolder == nil {
+                        Button { folderNameText = ""; folderNamePrompt = FolderNamePrompt() } label: {
+                            Label("New folder", systemImage: "folder.badge.plus")
+                        }
+                        .buttonStyle(.prismGhost)
+                        .help("Make a folder and drag projects into it")
+                    }
                     if !unfinished.isEmpty {
                         Button { showUnfinishedProjects.toggle() } label: {
                             HStack(spacing: 6) {
@@ -1707,7 +1947,17 @@ struct ContentView: View {
                             .help("Projects where a video was uploaded but no Shorts were made")
                     }
                 }
-                if model.recentProjectPaths.isEmpty {
+                if openFolder == nil && !model.projectFolders.isEmpty {
+                    folderGrid
+                }
+                if let openFolder, shown.isEmpty {
+                    VStack(spacing: 10) {
+                        Image(systemName: "folder").font(Prism.text(34)).foregroundStyle(Prism.textSecondary)
+                        Text("\(openFolder.name) is empty").font(Prism.text(14, .medium))
+                        Text("Go back to Projects and drag a project onto this folder, or right-click a project › Move to folder.")
+                            .foregroundStyle(Prism.textSecondary).multilineTextAlignment(.center)
+                    }.frame(maxWidth: .infinity).padding(48).background(Prism.surface1, in: RoundedRectangle(cornerRadius: 16))
+                } else if model.recentProjectPaths.isEmpty {
                     VStack(spacing: 10) {
                         Image(systemName: "rectangle.stack").font(Prism.text(34)).foregroundStyle(Prism.textSecondary)
                         Text("Your projects will appear here").font(Prism.text(14, .medium))
@@ -1738,6 +1988,21 @@ struct ContentView: View {
             }.padding(24).frame(maxWidth: 1800, alignment: .leading).frame(maxWidth: .infinity)
         }
         .task(id: model.recentProjectPaths) { projectShortCounts = await Self.shortCounts(model.recentProjectPaths) }
+        .alert(folderNamePrompt?.folderID == nil ? "New folder" : "Rename folder",
+               isPresented: Binding(get: { folderNamePrompt != nil }, set: { if !$0 { folderNamePrompt = nil } })) {
+            TextField("Folder name", text: $folderNameText)
+            Button(folderNamePrompt?.folderID == nil ? "Create" : "Rename") {
+                if let prompt = folderNamePrompt {
+                    if let id = prompt.folderID { model.renameFolder(id, to: folderNameText) }
+                    else if let id = model.createFolder(named: folderNameText), let path = prompt.movingProject {
+                        model.moveProject(path, toFolder: id)
+                    }
+                }
+                folderNamePrompt = nil
+            }
+            .disabled(folderNameText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            Button("Cancel", role: .cancel) { folderNamePrompt = nil }
+        }
         .alert("Rename project", isPresented: Binding(get: { renameProjectPath != nil }, set: { if !$0 { renameProjectPath = nil } })) {
             TextField("Project name", text: $renameText)
             Button("Rename") {
@@ -1758,6 +2023,42 @@ struct ContentView: View {
         }
         .sheet(item: $statsProject) { project in ProjectStatsView(path: project.path) }
     }
+    var folderGrid: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 160, maximum: 220), spacing: 12)], alignment: .leading, spacing: 14) {
+            ForEach(model.projectFolders) { folder in
+                let count = folder.projectPaths.filter { model.recentProjectPaths.contains($0) }.count
+                let targeted = dropTargetFolder == folder.id
+                Button { openFolderID = folder.id } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: targeted ? "folder.fill.badge.plus" : "folder.fill")
+                            .font(Prism.text(26)).foregroundStyle(Prism.accent)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(folder.name).font(Prism.text(13, .medium)).lineLimit(1)
+                            Text(count == 1 ? "1 project" : "\(count) projects").font(Prism.text(11)).foregroundStyle(Prism.textSecondary)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .padding(14)
+                    .frame(maxWidth: .infinity, minHeight: 64, alignment: .leading)
+                    .background(targeted ? Prism.accent.opacity(0.14) : Prism.surface1, in: RoundedRectangle(cornerRadius: 12))
+                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(targeted ? Prism.accent : .clear, lineWidth: 2))
+                    .contentShape(RoundedRectangle(cornerRadius: 12))
+                }
+                .buttonStyle(.plain).pointerFeedback()
+                .dropDestination(for: String.self) { paths, _ in
+                    paths.forEach { model.moveProject($0, toFolder: folder.id) }
+                    return !paths.isEmpty
+                } isTargeted: { dropTargetFolder = $0 ? folder.id : (dropTargetFolder == folder.id ? nil : dropTargetFolder) }
+                .contextMenu {
+                    Button { folderNameText = folder.name; folderNamePrompt = FolderNamePrompt(folderID: folder.id) } label: { Label("Rename…", systemImage: "pencil") }
+                    Divider()
+                    Button(role: .destructive) { model.deleteFolder(folder.id) } label: { Label("Delete folder (keeps projects)", systemImage: "folder.badge.minus") }
+                }
+                .accessibilityLabel("Folder \(folder.name), \(count) projects")
+                .help("Open folder · drop projects here")
+            }
+        }
+    }
     func beginRename(_ path: String) {
         let stored = try? ProjectStore(root: URL(fileURLWithPath: path)).load(ProjectData.self, key: "project")
         renameText = stored?.displayTitle ?? URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
@@ -1767,8 +2068,19 @@ struct ContentView: View {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 160, maximum: 220), spacing: 12)], alignment: .leading, spacing: 14) {
             ForEach(paths, id: \.self) { path in
                 RecentProjectCard(path: path, revision: model.projectListRevision) { model.open(URL(fileURLWithPath: path)) }
+                    .draggable(path)
                     .contextMenu {
                         Button { beginRename(path) } label: { Label("Rename…", systemImage: "pencil") }
+                        Menu {
+                            ForEach(model.projectFolders.filter { !$0.projectPaths.contains(path) }) { folder in
+                                Button(folder.name) { model.moveProject(path, toFolder: folder.id) }
+                            }
+                            if !model.projectFolders.isEmpty { Divider() }
+                            Button("New folder…") { folderNameText = ""; folderNamePrompt = FolderNamePrompt(movingProject: path) }
+                        } label: { Label("Move to folder", systemImage: "folder") }
+                        if model.projectFolders.contains(where: { $0.projectPaths.contains(path) }) {
+                            Button { model.moveProject(path, toFolder: nil) } label: { Label("Remove from folder", systemImage: "folder.badge.minus") }
+                        }
                         Button { statsProject = ProjectPath(path: path) } label: { Label("Show stats", systemImage: "chart.bar") }
                         Divider()
                         Button(role: .destructive) { deleteProjectPath = path } label: { Label("Move to Trash", systemImage: "trash") }
@@ -1821,7 +2133,7 @@ struct ContentView: View {
             }
             Spacer()
             Button { model.screen = .home } label: { Label("Back to Home", systemImage: "chevron.left") }
-                .buttonStyle(.plain).pointerFeedback().foregroundStyle(Prism.textSecondary)
+                .buttonStyle(.prismLink).pointerFeedback().foregroundStyle(Prism.textSecondary)
         }
         .padding(38)
         .frame(maxWidth: 1200, maxHeight: .infinity, alignment: .topLeading)
@@ -1831,25 +2143,40 @@ struct ContentView: View {
         ScrollView {
             VStack(spacing: 20) {
                 VStack(spacing: 8) {
-                    Text(model.shortsSource == nil ? "Step 1 of 4 · Choose video"
-                         : choosingCaptions ? "Step 3 of 4 · Choose captions" : "Step 2 of 4 · Set up Shorts")
+                    Text(model.shortsSource == nil ? "Step 1 of 5 · Choose video"
+                         : choosingType ? "Step 4 of 5 · Choose content type"
+                         : choosingCaptions ? "Step 3 of 5 · Choose captions" : "Step 2 of 5 · Set up Shorts")
                         .font(Prism.text(12, .medium)).foregroundStyle(Prism.textSecondary)
                     Text(model.shortsSource == nil ? "Add your long video"
+                         : choosingType ? "What kind of video is it?"
                          : choosingCaptions ? "Choose your captions" : "Choose your Short settings")
                         .font(Prism.display(36))
                     Text(model.shortsSource == nil ? "Upload a video first. Then choose clip lengths and which part to analyze."
+                         : choosingType ? "This tells Prism what to look for and how to lay out each Short. You can change the layout for each Short in the editor."
                          : choosingCaptions ? "Pick how speech appears on your Shorts. You can change it for each Short in the editor."
                          : "Your video is ready. Choose how to turn it into Shorts.")
                         .font(Prism.text(16)).foregroundStyle(Prism.textSecondary)
                 }
-                if let video = model.shortsSource, choosingCaptions {
+                if let video = model.shortsSource, choosingType {
+                    typeChoice
+                    HStack {
+                        Button { choosingType = false } label: { Label("Back to captions", systemImage: "chevron.left") }
+                            .controlSize(.large).pointerFeedback().keyboardShortcut(.cancelAction)
+                        Spacer()
+                        Button("Analyze and create Shorts") { model.continueImport() }
+                            .buttonStyle(.prismPrimary).pointerFeedback().keyboardShortcut(.defaultAction)
+                            .disabled(model.isBusy || model.customRangeError != nil)
+                    }
+                    .accessibilityElement(children: .contain)
+                    .accessibilityLabel("Content type for \(video.name)")
+                } else if let video = model.shortsSource, choosingCaptions {
                     captionChoice
                     HStack {
                         Button { choosingCaptions = false } label: { Label("Back to settings", systemImage: "chevron.left") }
-                            .controlSize(.large).pointerFeedback()
+                            .controlSize(.large).pointerFeedback().keyboardShortcut(.cancelAction)
                         Spacer()
-                        Button("Analyze and create Shorts") { model.continueImport() }
-                            .buttonStyle(.prismPrimary).pointerFeedback()
+                        Button { choosingType = true } label: { Label("Next: Choose content type", systemImage: "chevron.right") }
+                            .buttonStyle(.prismPrimary).pointerFeedback().keyboardShortcut(.defaultAction)
                             .disabled(model.isBusy || model.customRangeError != nil)
                     }
                     .accessibilityElement(children: .contain)
@@ -1865,23 +2192,25 @@ struct ContentView: View {
                     .background(Prism.surface1, in: RoundedRectangle(cornerRadius: 16))
                     shortsConfiguration
                     Button { choosingCaptions = true } label: { Label("Next: Choose captions", systemImage: "chevron.right") }
-                        .buttonStyle(.prismPrimary).pointerFeedback()
+                        .buttonStyle(.prismPrimary).pointerFeedback().keyboardShortcut(.defaultAction)
                         .disabled(model.isBusy || model.customRangeError != nil)
                 } else {
                     videoUploadControls
                 }
                 Button { model.screen = .home } label: { Label("Back to Home", systemImage: "chevron.left") }
-                    .buttonStyle(.plain).pointerFeedback().foregroundStyle(Prism.textSecondary).frame(maxWidth: .infinity, alignment: .leading)
+                    .buttonStyle(.prismLink).pointerFeedback().foregroundStyle(Prism.textSecondary).frame(maxWidth: .infinity, alignment: .leading)
             }
             .disabled(model.isBusy)
             .padding(30).frame(maxWidth: 920, alignment: .top).frame(maxWidth: .infinity)
         }
         .onAppear {
             choosingCaptions = false
+            choosingType = false
             if model.customEndMinutes.isEmpty, let video = model.shortsSource { model.resetSourceRange(for: video) }
         }
         .onChange(of: model.selection) { _, _ in
             choosingCaptions = false
+            choosingType = false
             if let video = model.shortsSource { model.resetSourceRange(for: video) }
         }
     }
@@ -1930,14 +2259,41 @@ struct ContentView: View {
             .background(Prism.surface1, in: RoundedRectangle(cornerRadius: 16))
 
     }
+    var typeChoice: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 240), spacing: 14)], alignment: .leading, spacing: 14) {
+            ForEach(VideoType.allCases) { type in
+                let selected = model.shortVideoType == type
+                Button { model.shortVideoType = type } label: {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Image(systemName: type.icon).font(Prism.text(20)).foregroundStyle(selected ? Prism.accent : Prism.textSecondary)
+                            Spacer()
+                            Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                                .foregroundStyle(selected ? Prism.accent : Prism.textSecondary)
+                        }
+                        Text(type.title).font(Prism.text(14, .medium))
+                        Text(type.detail).font(Prism.text(12)).foregroundStyle(Prism.textSecondary).lineLimit(3, reservesSpace: true)
+                    }
+                    .padding(16)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(selected ? Prism.surface2 : Prism.surface1, in: RoundedRectangle(cornerRadius: 16))
+                    .overlay(RoundedRectangle(cornerRadius: 16).stroke(selected ? Color.accentColor : .clear, lineWidth: 2))
+                    .contentShape(RoundedRectangle(cornerRadius: 16))
+                }
+                .buttonStyle(.plain).pointerFeedback()
+                .accessibilityAddTraits(selected ? .isSelected : [])
+            }
+        }
+    }
     var captionChoice: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top, spacing: 16) {
-                captionCard(.classic, title: "Simple", detail: "White text with a black outline. No background.")
-                captionCard(.viral, title: "Viral highlight", detail: "Same look. Each spoken word turns yellow as it is said.")
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), spacing: 14)], alignment: .leading, spacing: 14) {
+                ForEach(CaptionStyle.allCases) { style in
+                    captionCard(style, title: style.title, detail: style.detail)
+                }
             }
-            if model.shortCaptionStyle == .viral {
-                Text("Highlights follow speech timing. If a clip has no reliable word timing, its captions appear without highlights.")
+            if model.shortCaptionStyle.usesWordTiming {
+                Text("This style follows each spoken word. Prism measures word timing on this Mac; if a clip has none, its captions show as whole phrases.")
                     .font(Prism.text(12)).foregroundStyle(Prism.textSecondary)
             }
         }
@@ -1946,11 +2302,13 @@ struct ContentView: View {
         let selected = model.shortCaptionStyle == style
         return Button { model.shortCaptionStyle = style } label: {
             VStack(alignment: .leading, spacing: 12) {
-                CaptionStyleSample(highlight: style == .viral)
-                    .frame(maxWidth: .infinity).frame(height: 120)
-                    .background(Color.gray.opacity(0.35), in: RoundedRectangle(cornerRadius: 12))
+                CaptionStylePreview(style: style)
+                    .padding(.horizontal, 10)
+                    .frame(maxWidth: .infinity).frame(height: 84)
+                    .background(Color(white: 0.28), in: RoundedRectangle(cornerRadius: 12))
                 Label(title, systemImage: selected ? "checkmark.circle.fill" : "circle").font(Prism.text(14, .medium))
-                Text(detail).font(Prism.text(12)).foregroundStyle(Prism.textSecondary).fixedSize(horizontal: false, vertical: true)
+                // Two lines for every card, so cards in a row line up.
+                Text(detail).font(Prism.text(12)).foregroundStyle(Prism.textSecondary).lineLimit(2, reservesSpace: true)
             }
             .padding(16)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -2270,11 +2628,16 @@ struct RelioPlayerView: NSViewRepresentable {
         attachCaptions(to: view)
         return view
     }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    final class Coordinator { var captionSegment: EditSegment? }
     func updateNSView(_ view: AVPlayerView, context: Context) {
         if view.player !== player {
             view.player = player
             attachCaptions(to: view)
+        } else if context.coordinator.captionSegment != captionSegment {
+            attachCaptions(to: view)
         }
+        context.coordinator.captionSegment = captionSegment
     }
     private func attachCaptions(to view: AVPlayerView) {
         guard let overlay = view.contentOverlayView else { return }
