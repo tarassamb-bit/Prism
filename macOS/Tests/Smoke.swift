@@ -28,6 +28,114 @@ import AppKit
         print(String(format: "PASS live preview ready in %.2fs and draws the Fit background like export", elapsed))
     }
 
+    /// Phone video stores frames sideways with a 90° transform. Fit and Split draw with Core Image (y-up), so the
+    /// transform must be mirrored or the picture comes out upside down. The frame generator's oriented frame is the truth.
+    static func checkRotatedLayouts(in root: URL) async throws {
+        let url = root.appendingPathComponent("rotated.mov")
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: 360, AVVideoHeightKey: 640])
+        input.transform = CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: 640, ty: 0)
+        let attributes: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32ARGB, kCVPixelBufferWidthKey as String: 360, kCVPixelBufferHeightKey as String: 640]
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: attributes)
+        writer.add(input)
+        guard writer.startWriting() else { throw writer.error ?? NSError(domain: "RelioSmoke", code: 4) }
+        writer.startSession(atSourceTime: .zero)
+        for frame in 0..<60 {
+            while !input.isReadyForMoreMediaData { try await Task.sleep(for: .milliseconds(10)) }
+            var buffer: CVPixelBuffer?
+            CVPixelBufferCreate(kCFAllocatorDefault, 360, 640, kCVPixelFormatType_32ARGB, attributes as CFDictionary, &buffer)
+            guard let pixel = buffer else { fatalError("No pixel buffer") }
+            CVPixelBufferLockBaseAddress(pixel, [])
+            let context = CGContext(data: CVPixelBufferGetBaseAddress(pixel), width: 360, height: 640, bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(pixel), space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue)!
+            for (rect, color) in [(CGRect(x: 0, y: 320, width: 180, height: 320), NSColor.red), (CGRect(x: 180, y: 320, width: 180, height: 320), .green),
+                                  (CGRect(x: 0, y: 0, width: 180, height: 320), .blue), (CGRect(x: 180, y: 0, width: 180, height: 320), .yellow)] {
+                context.setFillColor(color.cgColor); context.fill(rect)
+            }
+            CVPixelBufferUnlockBaseAddress(pixel, [])
+            guard adaptor.append(pixel, withPresentationTime: CMTime(value: Int64(frame), timescale: 30)) else { throw writer.error ?? NSError(domain: "RelioSmoke", code: 5) }
+        }
+        input.markAsFinished()
+        await writer.finishWriting()
+        func frame(_ asset: AVAsset, _ composition: AVVideoComposition? = nil) throws -> NSBitmapImageRep {
+            let generator = AVAssetImageGenerator(asset: asset)
+            generator.appliesPreferredTrackTransform = true
+            generator.videoComposition = composition
+            return NSBitmapImageRep(cgImage: try generator.copyCGImage(at: CMTime(seconds: 1, preferredTimescale: 600), actualTime: nil))
+        }
+        func colors(_ bitmap: NSBitmapImageRep, _ points: [(Double, Double)]) -> String {
+            points.map { x, y in
+                let c = bitmap.colorAt(x: Int(x), y: Int(y))!.usingColorSpace(.deviceRGB)!
+                return "\(c.redComponent > 0.5 ? "R" : "")\(c.greenComponent > 0.5 ? "G" : "")\(c.blueComponent > 0.5 ? "B" : "")"
+            }.joined(separator: ",")
+        }
+        // Oriented 640×360 corners: top-left, top-right, bottom-left, bottom-right.
+        let truth = try frame(AVURLAsset(url: url))
+        let corners = colors(truth, [(160, 90), (480, 90), (160, 270), (480, 270)])
+        let parts = corners.split(separator: ",")
+        // Fit shows the whole frame across 1080×607 in the middle; Split puts the left half on top, the right half below.
+        let checks: [(EditSegment, [(Double, Double)], String)] = [
+            (EditSegment(mediaID: UUID(), duration: 1.5, fitToFrame: true), [(270, 808), (810, 808), (270, 1112), (810, 1112)], corners),
+            ({ var s = EditSegment(mediaID: UUID(), duration: 1.5); s.splitScreen = true; return s }(),
+             [(540, 240), (540, 720), (540, 1200), (540, 1680)], [parts[0], parts[2], parts[1], parts[3]].joined(separator: ","))
+        ]
+        for (segment, points, expected) in checks {
+            let preview = try await ShortMaker.previewItem(source: url, segment: segment)
+            let exported = root.appendingPathComponent("rotated-\(UUID()).mp4")
+            try await ShortMaker.export(source: url, segment: segment, destination: exported)
+            for (name, bitmap) in [("preview", try frame(preview.asset, preview.videoComposition)), ("export", try frame(AVURLAsset(url: exported)))] {
+                let got = colors(bitmap, points)
+                precondition(got == expected, "Rotated video \(segment.splitScreen == true ? "Split" : "Fit") \(name) is misoriented: \(got), expected \(expected)")
+            }
+        }
+        print("PASS rotated phone video keeps its orientation in Fit and Split, preview and export")
+    }
+
+    /// Tone with pauses at 2.0–2.4 s and 5.0–5.5 s: cuts placed inside the sound move into the nearest pause.
+    static func checkSilenceSnapping(in root: URL) async throws {
+        let url = root.appendingPathComponent("pauses.caf")
+        let format = AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1)!
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 128_000)!
+        buffer.frameLength = 128_000
+        for index in 0..<128_000 {
+            let t = Double(index) / 16_000
+            let pause = (2.0..<2.4).contains(t) || (5.0..<5.5).contains(t)
+            buffer.floatChannelData![0][index] = pause ? 0 : Float(0.4 * sin(2 * .pi * 220 * t))
+        }
+        try AVAudioFile(forWriting: url, settings: format.settings).write(from: buffer)
+        // Real videos carry 48 kHz stereo AAC; the reader converts it to the 16 kHz mono it measures.
+        let aac = root.appendingPathComponent("pauses.m4a")
+        let stereo = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+        let stereoBuffer = AVAudioPCMBuffer(pcmFormat: stereo, frameCapacity: 384_000)!
+        stereoBuffer.frameLength = 384_000
+        for index in 0..<384_000 {
+            let value = buffer.floatChannelData![0][index / 3]
+            stereoBuffer.floatChannelData![0][index] = value
+            stereoBuffer.floatChannelData![1][index] = value
+        }
+        // The file is finished only when the AVAudioFile is released, so it is written in one statement.
+        try AVAudioFile(forWriting: aac, settings: [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 48_000, AVNumberOfChannelsKey: 2]).write(from: stereoBuffer)
+        for file in [url, aac] {
+            let snapped = await ShortMaker.silenceSnapped(url: file, start: 2.55, duration: 2.3, interval: (0, 8))
+            precondition((2.0...2.42).contains(snapped.start) && (5.0...5.52).contains(snapped.start + snapped.duration),
+                         "Cuts must move into the nearest pauses (\(file.pathExtension)): \(snapped)")
+        }
+        let solid = await ShortMaker.silenceSnapped(url: url, start: 0.8, duration: 0.7, interval: (0, 8))
+        precondition(solid.start == 0.8 && solid.duration == 0.7, "Without a pause nearby the cut must stay")
+        let protected = await ShortMaker.silenceSnapped(url: url, start: 2.55, duration: 2.3, interval: (0, 8),
+                                                        words: [TimedSpeechWord(text: "pause", start: 1.9, duration: 0.6)])
+        precondition(protected.start == 2.55, "A pause inside a timed word is not a real pause")
+        func words(_ texts: [String]) -> [TimedSpeechWord] { texts.enumerated().map { TimedSpeechWord(text: $1, start: 10 + Double($0) * 0.4, duration: 0.3) } }
+        let opened = ShortMaker.strongOpening(start: 9.9, duration: 20, words: words(["So,", "um,", "nobody", "expected", "this."]), minDuration: 5)
+        precondition(abs(opened.start - 10.72) < 0.001 && abs(opened.start + opened.duration - 29.9) < 0.001, "Weak openers must be dropped: \(opened)")
+        let kept = ShortMaker.strongOpening(start: 9.9, duration: 20, words: words(["Nobody", "expected", "this."]), minDuration: 5)
+        precondition(kept.start == 9.9, "A strong opening must stay")
+        let meaningful = ShortMaker.strongOpening(start: 9.9, duration: 20, words: words(["Like", "most", "people,", "I", "panicked."]), minDuration: 5)
+        precondition(meaningful.start == 9.9, "Words that carry meaning at the start, like \"Like most people\", must stay")
+        let short = ShortMaker.strongOpening(start: 9.9, duration: 1, words: words(["So", "go."]), minDuration: 1)
+        precondition(short.start == 9.9, "Trimming must not break the minimum length")
+        print("PASS cuts snap into the nearest audio pause, never into a word; weak openers are dropped")
+    }
+
     static func main() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("RelioTest-\(UUID())")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -42,6 +150,12 @@ import AppKit
         let segment = EditSegment(mediaID: imported.id, start: 0, duration: 3, caption: "Three picture test")
         try store.save(ProjectData(name: "Picture project", media: [imported], segments: [segment]), key: "project")
         guard let reopened = try store.load(ProjectData.self, key: "project"), reopened.media.count == 1, reopened.segments.first?.caption == "Three picture test" else { fatalError("Persistence failed") }
+        let notAProject = root.appendingPathComponent("Not a project")
+        try FileManager.default.createDirectory(at: notAProject, withIntermediateDirectories: true)
+        precondition((try? ProjectStore(root: notAProject, create: false)) == nil
+                     && (try? FileManager.default.contentsOfDirectory(atPath: notAProject.path))?.isEmpty == true
+                     && (try? ProjectStore(root: root.appendingPathComponent("Picture project.relio"), create: false)) != nil,
+                     "Opening a folder that is not a project must fail without leaving a database in it")
         print("PASS project persistence")
         let invalidSource = root.appendingPathComponent("invalid.mp4")
         try Data("not a video".utf8).write(to: invalidSource)
@@ -118,6 +232,8 @@ import AppKit
         let fitPreview = NSBitmapImageRep(cgImage: fitFrame).representation(using: .png, properties: [:])!
         try FileManager.default.createDirectory(atPath: "test-output", withIntermediateDirectories: true)
         try fitPreview.write(to: URL(fileURLWithPath: "test-output/fit-blur-frame.png"))
+        try await checkRotatedLayouts(in: root)
+        try await checkSilenceSnapping(in: root)
         print("PASS fit framing fills the top and bottom with a blurred source and keeps the centered video sharp")
         try await checkLivePreview(source: source, mediaID: imported.id)
         func pixels(_ url: URL, _ seconds: Double) throws -> [UInt8] {
@@ -303,6 +419,17 @@ import AppKit
         let frame = try generator.copyCGImage(at: CMTime(seconds: 1.5, preferredTimescale: 600), actualTime: nil)
         let image = NSBitmapImageRep(cgImage: frame)
         try image.representation(using: .jpeg, properties: [.compressionFactor: 0.85])!.write(to: artifacts.appendingPathComponent("picture-short-frame.jpg"))
+        for quality in [ShortMaker.ExportQuality.small, .compact] {
+            let url = artifacts.appendingPathComponent("quality-\(quality.rawValue)-\(UUID()).mp4")
+            try await ShortMaker.export(source: source, segment: EditSegment(mediaID: UUID(), duration: 2), destination: url, quality: quality)
+            let track = try await AVURLAsset(url: url).loadTracks(withMediaType: .video)[0]
+            let size = try await track.load(.naturalSize)
+            let codec = try await track.load(.formatDescriptions).first.map { CMFormatDescriptionGetMediaSubType($0) }
+            precondition(quality == .small ? (size.width == 720 && size.height == 1280) : (size.width == 1080 && codec == kCMVideoCodecType_HEVC),
+                         "\(quality.title) export came out \(size) codec \(String(describing: codec))")
+            try? FileManager.default.removeItem(at: url)
+        }
+        print("PASS export quality: 720p is 720×1280, HEVC is HEVC")
         print("Saved test-output/picture-short.mp4 and preview frame")
     }
     private static func makePictureVideo(at url: URL) async throws {

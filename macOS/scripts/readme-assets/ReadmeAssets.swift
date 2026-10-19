@@ -68,6 +68,8 @@ import SwiftUI
     @MainActor static func main() async throws {
         let work = URL(fileURLWithPath: CommandLine.arguments[1])
         let output = URL(fileURLWithPath: CommandLine.arguments[2])
+        // macOS ignores TMPDIR for the temporary directory, so keep render caches inside the throwaway work folder.
+        ShortMaker.renderCacheDirectory = work.appendingPathComponent("RenderCache")
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         precondition(support.path.hasPrefix(work.path), "Run scripts/readme-assets.sh: the demo library must stay out of your real one.")
         let domain = ProcessInfo.processInfo.processName

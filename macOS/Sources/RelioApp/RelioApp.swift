@@ -44,8 +44,32 @@ final class AppModel {
     }
     var generationStartedAt = Date.now
     var generationStage = ""
+    /// Set when an overloaded model handed requests to another model during the current Shorts run.
+    var modelFallbackNote: String?
     /// Why the last Shorts run produced nothing; shown as a blocking popup in the editor.
-    var generationError: String?
+    var generationError: GenerationFailure?
+    /// The popup's title, advice and buttons follow `kind`, so a busy server is never blamed on the video or its range.
+    struct GenerationFailure {
+        enum Kind { case noMoments, settings, temporary, other }
+        var message: String
+        var kind: Kind
+    }
+
+    /// What a failed run needs: another range, a Settings change, or simply another try later.
+    nonisolated static func failureKind(_ error: Error) -> GenerationFailure.Kind {
+        let error = (error as? GeminiSelection.StageFailure)?.underlying ?? error
+        if error is URLError { return .temporary }
+        guard let failure = error as? GeminiSelection.Failure else {
+            return (error as? ShortMaker.Failure) == .invalidRange ? .noMoments : .other
+        }
+        switch failure {
+        case .noStrongClips, .noDistinctClips, .requestTooLarge: return .noMoments
+        case .invalidConfiguration: return .settings
+        case .request(let status): return [400, 401, 403, 404].contains(status) ? .settings : .temporary
+        case .invalidResponse, .invalidTiming: return .temporary
+        case .audioExport: return .other
+        }
+    }
     private var generationTask: Task<Void, Never>?
     /// Export uses the progress popup too, but its Cancel keeps you in the editor.
     var isExporting = false
@@ -74,7 +98,8 @@ final class AppModel {
     var geminiKey = ""
     var revealedGeminiKey = ""
     private var cachedGeminiKey = ""
-    private var didLoadGeminiKeyFromKeychain = false
+    /// Tests set this so the model never reads the person's real key from Keychain or calls Gemini.
+    var didLoadGeminiKeyFromKeychain = false
     var isGeminiKeySaved = UserDefaults.standard.bool(forKey: "shorts.geminiKeySaved")
     var isEditingGeminiKey = false
     var isShowingGeminiKey = false
@@ -82,7 +107,9 @@ final class AppModel {
     // an access dialog before the user has chosen to use Cloud AI.
     var geminiKeyStatus = UserDefaults.standard.bool(forKey: "shorts.geminiKeySaved")
         ? "Your API key is saved securely in Keychain. For security, the saved value stays hidden."
-        : "Add a Google AI Studio API key to enable Cloud AI."
+        : ""
+    /// Google refused the last key that was checked; the key card shows the reason as a warning.
+    var geminiKeyRejected = false
     var isTestingGemini = false
     var shortCount = 3
     var shortDuration = 30.0
@@ -183,10 +210,29 @@ final class AppModel {
         revealedGeminiKey = savedKey
         isShowingGeminiKey = true
     }
-    /// Gemini is Prism's only AI; nil when no key is saved.
+    /// Gemini is Prism's only AI; nil when no key is saved. Every task shows its retries while they happen, and a switch
+    /// to another model is added to the task's final message (`withModelNote`).
     func geminiConfiguration() -> GeminiConfiguration? {
         let key = geminiAPIKey()
-        return key.isEmpty ? nil : .init(apiKey: key, model: geminiModel)
+        guard !key.isEmpty else { return nil }
+        var configuration = GeminiConfiguration(apiKey: key, model: geminiModel)
+        configuration.onRetry = { note in
+            Task { @MainActor in
+                self.message = note
+                if self.generationProgress != nil, self.generationStage != "Cancelling…" { self.generationStage = note }
+            }
+        }
+        configuration.onFallback = { from, to in
+            Task { @MainActor in self.modelFallbackNote = "\(from) was overloaded, so Prism switched to \(to)." }
+        }
+        return configuration
+    }
+
+    /// `text` plus the model switch made during the task that just finished, reported once.
+    func withModelNote(_ text: String) -> String {
+        guard let note = modelFallbackNote else { return text }
+        modelFallbackNote = nil
+        return text + " " + note
     }
     func geminiAPIKey() -> String {
         guard !didLoadGeminiKeyFromKeychain else { return cachedGeminiKey }
@@ -194,11 +240,40 @@ final class AppModel {
         didLoadGeminiKeyFromKeychain = true
         return cachedGeminiKey
     }
+    /// Checks the typed key with one tiny Gemini request, then saves it. A key Google refuses is never saved. When Google
+    /// is busy or the Mac is offline the key is saved anyway, so an outage can't lock anyone out of the app.
+    func verifyAndSaveGeminiKey() {
+        let key = geminiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty, !isTestingGemini else { return }
+        isTestingGemini = true
+        geminiKeyRejected = false
+        geminiKeyStatus = "Checking your key with Google…"
+        let configuration = GeminiConfiguration(apiKey: key, model: geminiModel)
+        Task {
+            defer { isTestingGemini = false }
+            var unconfirmed: String?
+            do {
+                struct Check: Decodable { let ok: Bool }
+                let _: Check = try await GeminiSelection.generate(parts: [["text": "Return ok true."]],
+                    schema: ["type": "OBJECT", "properties": ["ok": ["type": "BOOLEAN"]], "required": ["ok"]], configuration: configuration)
+            } catch GeminiSelection.Failure.request(let status) where [400, 401, 403].contains(status) {
+                geminiKeyRejected = true
+                geminiKeyStatus = "Google didn’t accept this key (HTTP \(status)). Copy the whole key from Google AI Studio and paste it again."
+                return
+            } catch {
+                unconfirmed = "Saved. Google couldn’t confirm the key right now (\(error.localizedDescription)); Prism will use it when Google answers."
+            }
+            saveGeminiKey()
+            if let unconfirmed { geminiKeyStatus = unconfirmed }
+        }
+    }
+
     func testGeminiKey() {
         guard !isTestingGemini else { return }
         let key = geminiAPIKey()
         guard !key.isEmpty else { geminiKeyStatus = "Save a Google AI Studio key first."; return }
-        let configuration = GeminiConfiguration(apiKey: key, model: geminiModel)
+        guard let configuration = geminiConfiguration() else { return }
+        modelFallbackNote = nil
         isTestingGemini = true
         geminiKeyStatus = "Testing Gemini access…"
         Task {
@@ -207,7 +282,7 @@ final class AppModel {
                 struct Check: Decodable { let ok: Bool }
                 let result: Check = try await GeminiSelection.generate(parts: [["text": "Return ok true."]],
                     schema: ["type": "OBJECT", "properties": ["ok": ["type": "BOOLEAN"]], "required": ["ok"]], configuration: configuration)
-                geminiKeyStatus = result.ok ? "Connected. Gemini is ready for cloud editing." : "Gemini returned an unexpected response."
+                geminiKeyStatus = result.ok ? withModelNote("Connected. Gemini is ready for cloud editing.") : "Gemini returned an unexpected response."
             } catch { geminiKeyStatus = error.localizedDescription }
         }
     }
@@ -233,6 +308,7 @@ final class AppModel {
             sourcePath = ""
             editHistory = []
             exportedFiles = []
+            lastExportFolder = nil
             chatMessages = []
             project = ProjectData(name: name)
             try save()
@@ -262,7 +338,7 @@ final class AppModel {
     func open(_ url: URL) {
         guard !isBusy else { return }
         do {
-            let s = try ProjectStore(root: url)
+            let s = try ProjectStore(root: url, create: false)
             guard var p = try s.load(ProjectData.self, key: "project") else { throw ProjectStore.StoreError.database }
             // Resolve managed assets relative to the project when a project folder is moved.
             for index in p.media.indices {
@@ -273,7 +349,7 @@ final class AppModel {
                     if FileManager.default.fileExists(atPath: relocatedThumbnail.path) { p.media[index].thumbnail = relocatedThumbnail.path }
                 }
             }
-            editHistory = []; exportedFiles = []; chatMessages = []; store = s; project = p; projectURL = url; selection = p.media.first?.id
+            editHistory = []; exportedFiles = []; lastExportFolder = nil; chatMessages = []; store = s; project = p; projectURL = url; selection = p.media.first?.id
             lastSavedAt = (try? url.appendingPathComponent("project.sqlite").resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
             UserDefaults.standard.set(url.path, forKey: "lastProject")
             remember(url)
@@ -298,7 +374,7 @@ final class AppModel {
             guard folder.pathExtension == "relio",
                   fileManager.fileExists(atPath: folder.appendingPathComponent("project.sqlite").path),
                   !knownPaths.contains(folder.path),
-                  let projectStore = try? ProjectStore(root: folder),
+                  let projectStore = try? ProjectStore(root: folder, create: false),
                   let project = try? projectStore.load(ProjectData.self, key: "project") else { return nil }
             return (folder.path, project.created)
         }.sorted { $0.1 > $1.1 }
@@ -332,7 +408,7 @@ final class AppModel {
         let size = fileSize(video.path)
         var best: SentenceTranscript?
         for path in recentProjectPaths where path != projectURL?.path {
-            guard let other = try? ProjectStore(root: URL(fileURLWithPath: path)).load(ProjectData.self, key: "project") else { continue }
+            guard let other = try? ProjectStore(root: URL(fileURLWithPath: path), create: false).load(ProjectData.self, key: "project") else { continue }
             for media in other.media where media.name == video.name && abs(media.duration - video.duration) < 0.01
                 && media.width == video.width && media.height == video.height && fileSize(media.path) == size {
                 guard let transcript = other.transcripts?[media.id.uuidString] else { continue }
@@ -390,7 +466,7 @@ final class AppModel {
                 project?.title = title
                 try save()
             } else {
-                let projectStore = try ProjectStore(root: URL(fileURLWithPath: path))
+                let projectStore = try ProjectStore(root: URL(fileURLWithPath: path), create: false)
                 guard var stored = try projectStore.load(ProjectData.self, key: "project") else { throw ProjectStore.StoreError.database }
                 stored.title = title
                 try projectStore.save(stored, key: "project")
@@ -471,16 +547,27 @@ final class AppModel {
             message = "Reading video metadata and creating thumbnail…"
             let item = await MediaEngine.inspect(copiedURL, thumbnailDirectory: projectURL.appendingPathComponent("Thumbnails"))
             if let item {
-                project?.media.append(item)
+                // "Choose a different video" before any Shorts exist replaces the first pick; otherwise the project
+                // kept the rejected copy and was named after it.
+                let previousMedia = project?.media ?? []
+                let previousTranscripts = project?.transcripts
+                let replaced = !returnToEditor && project?.segments.isEmpty == true ? previousMedia : []
+                project?.media = previousMedia.filter { media in !replaced.contains { $0.id == media.id } } + [item]
+                for old in replaced { project?.transcripts?[old.id.uuidString] = nil }
                 selection = item.id
                 resetSourceRange(for: item)
                 player = AVPlayer(url: copiedURL)
                 do { try save() } catch {
-                    project?.media.removeAll { $0.id == item.id }
+                    project?.media = previousMedia
+                    project?.transcripts = previousTranscripts
                     try? FileManager.default.removeItem(at: copiedURL)
                     message = "Could not save import: \(error.localizedDescription)"
                     isBusy = false
                     return
+                }
+                // Only the project's own copies are deleted, never a file outside it.
+                for path in replaced.flatMap({ [$0.path, $0.thumbnail].compactMap { $0 } }) where path.hasPrefix(projectURL.path + "/") {
+                    try? FileManager.default.removeItem(atPath: path)
                 }
                 previewShortID = nil
                 screen = returnToEditor ? .editor : .importSource
@@ -522,7 +609,12 @@ final class AppModel {
         previewRevision += 1
         let revision = previewRevision
         player?.pause()
-        guard let video = project?.media.first(where: { $0.id == shortID.flatMap { id in project?.segments.first(where: { $0.id == id })?.mediaID } }) ?? project?.media.first(where: { $0.id == selection }) else { return }
+        guard let video = project?.media.first(where: { $0.id == shortID.flatMap { id in project?.segments.first(where: { $0.id == id })?.mediaID } }) ?? project?.media.first(where: { $0.id == selection }) else {
+            // Nothing to show: drop the last project's player so its video and captions don't linger.
+            player = nil
+            previewSegment = nil
+            return
+        }
         guard let shortID, let segment = project?.segments.first(where: { $0.id == shortID }) else {
             previewSegment = nil
             player = AVPlayer(url: URL(fileURLWithPath: video.path))
@@ -531,13 +623,16 @@ final class AppModel {
         selection = video.id
         player = nil
         isPreviewLoading = true
-        if segment.cropTrackingVersion != SubjectFramer.version && segment.splitScreen != true, let configuration = geminiConfiguration() {
+        // Not while another job runs: tracking was the one job that could start mid-job, and its end cleared the
+        // other job's busy state. The Short previews with its saved framing and is tracked next time, or at export.
+        if !isBusy, segment.cropTrackingVersion != SubjectFramer.version && segment.splitScreen != true, let configuration = geminiConfiguration() {
             isBusy = true
             subjectTrackingRevision = revision
             message = "Gemini is framing the main subject…"
             Task {
                 let path = await ShortMaker.analyzeSubjectPath(
-                    URL(fileURLWithPath: video.path), start: segment.start, duration: segment.duration, zoom: segment.cropZoom ?? 1.08, configuration: configuration
+                    URL(fileURLWithPath: video.path), start: segment.start, duration: segment.duration, zoom: segment.cropZoom ?? 1.08, configuration: configuration,
+                            speech: segment.captions ?? []
                 )
                 guard revision == previewRevision, subjectTrackingRevision == revision,
                       let index = project?.segments.firstIndex(where: { $0.id == shortID }) else { return }
@@ -547,7 +642,8 @@ final class AppModel {
                     try save()
                     subjectTrackingRevision = nil
                     isBusy = false
-                    message = path.isEmpty ? "No clear subject found. The crop will stay steady." : "Subject tracking ready."
+                    // An empty path means Gemini could not be reached or answered badly; no subject still gives a steady path.
+                    message = withModelNote(path.isEmpty ? "Gemini could not frame this Short, so the crop stays centered. Use Re-track to try again." : "Subject tracking ready.")
                     selectPreview(shortID)
                 } catch {
                     subjectTrackingRevision = nil
@@ -586,9 +682,10 @@ final class AppModel {
         let customEnd = sourceRegion == .custom ? minuteSeconds(customEndMinutes) : nil
         guard let configuration = geminiConfiguration() else {
             message = "Add and save your Gemini key in Settings first."
-            generationError = "No Gemini API key is saved. Add your Google AI Studio key in Settings."
+            generationError = .init(message: "No Gemini API key is saved. Add your Google AI Studio key in Settings.", kind: .settings)
             return
         }
+        modelFallbackNote = nil
         isBusy = true; generationProgress = 0; generationError = nil; generationStage = "Preparing video"; message = "Preparing video analysis…"
         let sourceURL = URL(fileURLWithPath: video.path)
         let usedRanges = (project?.segments ?? []).filter { $0.mediaID == video.id }.map { SourceInterval(start: $0.start, end: $0.start + $0.duration) }
@@ -641,18 +738,20 @@ final class AppModel {
                 let fresh = try appendGeneratedShorts(candidates)
                 guard !fresh.isEmpty else {
                     message = "No new distinct moments were found in this range. Your existing clips were kept. Try another region or length."
-                    generationError = message
+                    generationError = .init(message: message, kind: .noMoments)
                     generationProgress = nil; generationTask = nil; isBusy = false
                     return
                 }
                 message = "Gemini selected \(fresh.count) complete clip ranges and layouts. Review framing and captions before export."
                 let warning = results.compactMap(\.analysisWarning).first
                 if let warning { message += " " + warning }
+                message = withModelNote(message)
                 chatMessages.append(.init(isUser: false, text: message))
                 selectPreview(fresh.first?.id)
             } catch {
                 message = Task.isCancelled ? "Generation cancelled. Your existing clips were kept." : "Analysis failed: \(error.localizedDescription)"
-                if !Task.isCancelled { generationError = error.localizedDescription }
+                if !Task.isCancelled { generationError = .init(message: error.localizedDescription, kind: Self.failureKind(error)) }
+                modelFallbackNote = nil
             }
             generationProgress = nil
             generationTask = nil
@@ -686,69 +785,137 @@ final class AppModel {
         return cleaned.isEmpty ? nil : String(cleaned.prefix(80))
     }
 
-    /// Exports every Short, or only the one with `id`.
-    func export(only id: UUID? = nil) {
-        guard !isBusy else { return }
-        guard let segments = project?.segments.filter({ id == nil || $0.id == id }), !segments.isEmpty else { return }
-        guard let projectURL else { return }
-        let media = project?.media ?? []
-        let projectName = project?.name ?? "Prism"
-        let exports = projectURL.appendingPathComponent("Exports")
-        try? FileManager.default.createDirectory(at: exports, withIntermediateDirectories: true)
+    /// What the export card is set to; nil while it is closed.
+    struct ExportChoice {
+        var shortIDs: Set<UUID>
+        var includeSource: Bool
+        var quality: ShortMaker.ExportQuality
+        var folder: URL
+        /// Why the last export attempt couldn't start, shown on the card.
+        var error: String? = nil
+    }
+    var exportChoice: ExportChoice?
+    /// Where and how the last export went, for the finished popup and the Exports button.
+    var lastExportFolder: URL?
+    var lastExportQuality = ShortMaker.ExportQuality.full
+    var lastExportShortCount = 0
+
+    /// Opens the export card with every Short ticked, or only the one with `id`.
+    func chooseExport(only id: UUID? = nil) {
+        guard !isBusy, let project, !project.media.isEmpty else { return }
+        let quality = ShortMaker.ExportQuality(rawValue: UserDefaults.standard.string(forKey: "export.quality") ?? "") ?? .full
+        exportChoice = .init(shortIDs: Set(project.segments.filter { id == nil || $0.id == id }.map(\.id)),
+                             includeSource: false, quality: quality, folder: defaultExportFolder())
+    }
+
+    /// Downloads › Prism › the project's name.
+    func defaultExportFolder() -> URL {
+        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
+        return downloads.appendingPathComponent("Prism").appendingPathComponent(Self.exportFileName(title: project?.displayTitle) ?? "Prism export")
+    }
+
+    /// Exports every Short with the saved quality to the default folder; used by the chat assistant.
+    func exportAll() {
+        chooseExport()
+        if let choice = exportChoice { export(choice) }
+    }
+
+    /// Renders the ticked Shorts and copies the main video if asked, into `choice.folder`.
+    func export(_ choice: ExportChoice) {
+        guard !isBusy, let project else { return }
+        let segments = project.segments.enumerated().filter { choice.shortIDs.contains($0.element.id) }
+        let sources = choice.includeSource ? project.media.filter { $0.kind == "video" } : []
+        guard !segments.isEmpty || !sources.isEmpty else { return }
+        do { try FileManager.default.createDirectory(at: choice.folder, withIntermediateDirectories: true) } catch {
+            // The card stays open with the reason, instead of closing and leaving it in the status line.
+            exportChoice = choice
+            exportChoice?.error = "Could not use this folder: \(error.localizedDescription) Choose another folder."
+            return
+        }
+        exportChoice = nil
+        UserDefaults.standard.set(choice.quality.rawValue, forKey: "export.quality")
+        let media = project.media
+        let projectName = project.displayTitle
+        let folder = choice.folder
+        let total = segments.count + sources.count
         exportedFiles = []
-        isBusy = true; message = segments.count == 1 ? "Rendering Short locally…" : "Rendering \(segments.count) Shorts locally…"
+        lastExportFolder = folder
+        lastExportQuality = choice.quality
+        lastExportShortCount = segments.count
+        isBusy = true; message = total == 1 ? "Exporting 1 file…" : "Exporting \(total) files…"
         isExporting = true; generationProgress = 0; generationStage = "Preparing export"
         generationTask = Task {
             do {
-                var exportedCount = 0
-                for (index, originalSegment) in segments.enumerated() {
+                for (step, (number, originalSegment)) in segments.enumerated() {
                     try Task.checkCancellation()
-                    generationProgress = Double(index) / Double(segments.count)
-                    generationStage = "Exporting Short \(index + 1) of \(segments.count)"
+                    generationProgress = Double(step) / Double(total)
+                    generationStage = "Exporting Short \(number + 1) · \(step + 1) of \(total)"
                     var segment = originalSegment
                     guard let video = media.first(where: { $0.id == segment.mediaID }) else { throw ShortMaker.Failure.noVideo }
                     if segment.cropTrackingVersion != SubjectFramer.version && segment.splitScreen != true, let configuration = geminiConfiguration() {
-                        message = "Gemini is framing Short \(index + 1) of \(segments.count)…"
+                        message = "Gemini is framing Short \(number + 1)…"
                         segment.cropKeyframes = await ShortMaker.analyzeSubjectPath(
-                            URL(fileURLWithPath: video.path), start: segment.start, duration: segment.duration, zoom: segment.cropZoom ?? 1.08, configuration: configuration
+                            URL(fileURLWithPath: video.path), start: segment.start, duration: segment.duration, zoom: segment.cropZoom ?? 1.08, configuration: configuration,
+                            speech: segment.captions ?? []
                         )
+                        // A cancelled analysis returns no path; saving it would freeze this Short's framing.
+                        try Task.checkCancellation()
                         segment.cropTrackingVersion = SubjectFramer.version
-                        if let storedIndex = project?.segments.firstIndex(where: { $0.id == segment.id }) {
-                            project?.segments[storedIndex].cropKeyframes = segment.cropKeyframes
-                            project?.segments[storedIndex].cropTrackingVersion = SubjectFramer.version
+                        if let storedIndex = self.project?.segments.firstIndex(where: { $0.id == segment.id }) {
+                            self.project?.segments[storedIndex].cropKeyframes = segment.cropKeyframes
+                            self.project?.segments[storedIndex].cropTrackingVersion = SubjectFramer.version
                             try save()
                         }
                     }
-                    message = "Rendering Short \(index + 1) of \(segments.count)…"
-                    let suffix = segments.count == 1 ? "" : " \(index + 1)"
-                    let destination = uniqueDestination(for: URL(fileURLWithPath: "\(Self.exportFileName(title: segment.suggestedTitle) ?? "\(projectName) Short\(suffix)").mp4"), in: exports)
-                    try await ShortMaker.export(source: URL(fileURLWithPath: video.path), segment: segment, destination: destination)
+                    message = "Rendering Short \(number + 1)…"
+                    let name = Self.exportFileName(title: segment.suggestedTitle) ?? "\(Self.exportFileName(title: projectName) ?? "Prism") Short \(number + 1)"
+                    let destination = uniqueDestination(for: URL(fileURLWithPath: "\(name).mp4"), in: folder)
+                    try await ShortMaker.export(source: URL(fileURLWithPath: video.path), segment: segment, destination: destination, quality: choice.quality)
                     exportedFiles.append(destination)
-                    exportedCount += 1
                 }
-                message = segments.count == 1 ? "Exported Short to Exports." : "Exported \(exportedCount) Shorts to Exports."
+                for video in sources {
+                    try Task.checkCancellation()
+                    generationProgress = Double(exportedFiles.count) / Double(total)
+                    generationStage = "Copying the main video"
+                    let original = URL(fileURLWithPath: video.path)
+                    let destination = uniqueDestination(for: original, in: folder)
+                    // A copy, not a re-render: the main video keeps its original quality. Same-drive copies are instant clones.
+                    try await Task.detached(priority: .userInitiated) { try FileManager.default.copyItem(at: original, to: destination) }.value
+                    exportedFiles.append(destination)
+                }
+                var parts: [String] = []
+                if !segments.isEmpty { parts.append(segments.count == 1 ? "1 Short" : "\(segments.count) Shorts") }
+                if !sources.isEmpty { parts.append("the main video") }
+                message = withModelNote("Exported \(parts.joined(separator: " and ")) to \(Self.displayPath(folder)).")
                 exportSummary = message
             }
             catch {
                 let completed = exportedFiles.count
                 message = Task.isCancelled
-                    ? "Export cancelled. \(completed) of \(segments.count) Shorts finished and are in Exports."
+                    ? "Export cancelled. \(completed) of \(total) files finished in \(Self.displayPath(folder))."
                     : completed == 0
                     ? "Export failed: \(error.localizedDescription)"
-                    : "Export stopped after \(completed) of \(segments.count) Shorts. Completed files are in Exports. \(error.localizedDescription)"
+                    : "Export stopped after \(completed) of \(total) files. Completed files are in \(Self.displayPath(folder)). \(error.localizedDescription)"
             }
             isBusy = false; isExporting = false; generationProgress = nil; generationTask = nil
         }
     }
+
+    /// "Downloads › Prism › My project" for a folder in the home folder, else the full path.
+    nonisolated static func displayPath(_ url: URL) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        guard url.path.hasPrefix(home + "/") else { return url.path }
+        return url.path.dropFirst(home.count + 1).split(separator: "/").joined(separator: " › ")
+    }
+
     func revealExports() {
-        guard let projectURL else { return }
-        let exports = projectURL.appendingPathComponent("Exports")
-        try? FileManager.default.createDirectory(at: exports, withIntermediateDirectories: true)
-        if exportedFiles.isEmpty {
-            NSWorkspace.shared.open(exports)
-        } else {
+        if !exportedFiles.isEmpty {
             NSWorkspace.shared.activateFileViewerSelecting(exportedFiles)
+            return
         }
+        let folder = [lastExportFolder, project == nil ? nil : defaultExportFolder()].compactMap { $0 }
+            .first { FileManager.default.fileExists(atPath: $0.path) } ?? projectURL?.appendingPathComponent("Exports")
+        if let folder { NSWorkspace.shared.open(folder) }
     }
     func revealLibrary() {
         NSWorkspace.shared.activateFileViewerSelecting([libraryURL])
@@ -770,24 +937,19 @@ final class AppModel {
         return nil
     }
     private func overlayInstruction(in text: String) -> (caption: String, start: Double, duration: Double?)? {
-        let lower = text.lowercased()
+        // Search the original text: indices from a lowercased copy drift when lowercasing changes a character's length (İ).
         let markers = ["text overlay", "add text", "put text", "show text", "write text"]
-        guard let marker = markers.first(where: { lower.contains($0) }),
-              let markerRange = lower.range(of: marker) else { return nil }
+        guard let markerRange = markers.lazy.compactMap({ text.range(of: $0, options: .caseInsensitive) }).first else { return nil }
         let originalTail = String(text[markerRange.upperBound...])
-        let lowerTail = originalTail.lowercased()
         let timingMarkers = [" in the first ", " in first ", " for the first ", " for first ", " during the first ", " during first ", " from ", " at "]
-        var cutOffset = originalTail.count
+        var cut = originalTail.endIndex
         var timingTail = ""
         for timing in timingMarkers {
-            if let found = lowerTail.range(of: timing) {
-                let offset = lowerTail.distance(from: lowerTail.startIndex, to: found.lowerBound)
-                guard offset < cutOffset else { continue }
-                cutOffset = offset
-                timingTail = String(lowerTail[found.lowerBound...])
+            if let found = originalTail.range(of: timing, options: .caseInsensitive), found.lowerBound < cut {
+                cut = found.lowerBound
+                timingTail = String(originalTail[found.lowerBound...]).lowercased()
             }
         }
-        let cut = originalTail.index(originalTail.startIndex, offsetBy: cutOffset)
         var caption = String(originalTail[..<cut]).trimmingCharacters(in: .whitespacesAndNewlines)
         for prefix in ["saying ", "that says ", "with ", ": "] where caption.lowercased().hasPrefix(prefix) {
             caption = String(caption.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -808,9 +970,10 @@ final class AppModel {
         return true
     }
     /// `captionsOnly` edits swap the caption overlay in place, so the player keeps its playhead.
-    private func applyEdit(captionsOnly: Bool = false, _ change: (inout EditSegment, MediaItem) -> String?) -> String? {
+    /// `id` edits that Short even when another one is open, without switching the preview to it.
+    private func applyEdit(to id: UUID? = nil, captionsOnly: Bool = false, _ change: (inout EditSegment, MediaItem) -> String?) -> String? {
         guard ensureSegment(),
-              let index = project?.segments.firstIndex(where: { $0.id == previewShortID }) ?? project?.segments.indices.first,
+              let index = project?.segments.firstIndex(where: { $0.id == (id ?? previewShortID) }) ?? (id == nil ? project?.segments.indices.first : nil),
               var segment = project?.segments[index],
               let video = project?.media.first(where: { $0.id == segment.mediaID }) else { return nil }
         rememberEdit()
@@ -819,7 +982,7 @@ final class AppModel {
         do {
             try save()
             if captionsOnly && player != nil && previewSegment?.id == segment.id { previewSegment = segment }
-            else { selectPreview(segment.id) }
+            else if id == nil || id == previewShortID { selectPreview(segment.id) }
             message = reply; return reply
         } catch {
             if let previous = editHistory.popLast() { project?.segments = previous }
@@ -853,13 +1016,14 @@ final class AppModel {
             let centers = await ShortMaker.findSplitCenters(URL(fileURLWithPath: video.path), start: segment.start, duration: segment.duration,
                                                            configuration: configuration)
             isBusy = false
-            guard previewShortID == segment.id else { return }
-            _ = applyEdit { segment, _ in
+            // Saved to the Short it was made for, even if another Short was opened meanwhile.
+            let reply = applyEdit(to: segment.id) { segment, _ in
                 segment.splitScreen = true; segment.captionPosition = .middle; segment.splitCenters = centers
-                return centers == nil
+                return withModelNote(centers == nil
                     ? "Split screen on. Couldn't find two faces, so the left half is on top and the right half on the bottom."
-                    : "Split screen: each speaker is centered in their half, captions in the middle."
+                    : "Split screen: each speaker is centered in their half, captions in the middle.")
             }
+            if reply == nil { message = "The Short was removed before split screen was ready." }
         }
     }
 
@@ -896,9 +1060,10 @@ final class AppModel {
                 message = "Could not transcribe Short: \(error.localizedDescription)"
                 return
             }
-            guard previewShortID == segmentID,
-                  let index = project?.segments.firstIndex(where: { $0.id == segmentID }) else {
+            // Saved to the Short it was made for, even if another Short was opened meanwhile.
+            guard let index = project?.segments.firstIndex(where: { $0.id == segmentID }) else {
                 isBusy = false
+                message = "The Short was removed before its subtitles were ready."
                 return
             }
             guard !result.cues.isEmpty else {
@@ -913,8 +1078,8 @@ final class AppModel {
             do {
                 try save()
                 isBusy = false
-                selectPreview(segmentID)
-                message = "Added \(result.cues.count) timed subtitle phrases." + (result.notice.map { " " + $0 } ?? "")
+                if previewShortID == segmentID { selectPreview(segmentID) }
+                message = withModelNote("Added \(result.cues.count) timed subtitle phrases." + (result.notice.map { " " + $0 } ?? ""))
             } catch {
                 if let previous = editHistory.popLast() { project?.segments = previous }
                 isBusy = false
@@ -988,76 +1153,89 @@ final class AppModel {
                             cropZoom: Double = 1.08, cropPosition: Double = 0.5) {
         guard !isBusy, activeSegment != nil else { return }
         if let reply = applyEdit({ segment, media in
-            guard start.isFinite, duration.isFinite, captionStart.isFinite, captionDuration.isFinite, cropZoom.isFinite, cropPosition.isFinite,
-                  start >= 0, duration > 0, start + duration <= media.duration + 0.001,
-                  cropZoom >= 1, cropZoom <= 1.5, cropPosition >= 0, cropPosition <= 1 else { return nil }
-            let oldSourceStart = segment.start
-            let absoluteWords = (segment.speechWords ?? []).map {
-                TimedSpeechWord(text: $0.text, start: oldSourceStart + $0.start, duration: $0.duration)
-            }
-            var finalStart = start
-            if let cutWord = absoluteWords.first(where: { $0.start + 0.02 < finalStart && $0.start + $0.duration - 0.02 > finalStart }) {
-                finalStart = max(0, cutWord.start)
-            }
-            var finalEnd = min(media.duration, finalStart + duration)
-            if let cutWord = absoluteWords.first(where: { $0.start + 0.02 < finalEnd && $0.start + $0.duration - 0.02 > finalEnd }) {
-                let wordEnd = cutWord.start + cutWord.duration
-                finalEnd = wordEnd <= media.duration ? wordEnd + 0.04 : max(finalStart + 0.1, cutWord.start)
-                finalEnd = min(media.duration, finalEnd)
-            }
-            let finalDuration = finalEnd - finalStart
-            guard finalDuration > 0, captionStart.isFinite, captionDuration > 0 else { return nil }
-            let finalCaptionStart = min(max(0, captionStart), max(0, finalDuration - 0.05))
-            let finalCaptionDuration = min(captionDuration, finalDuration - finalCaptionStart)
+            guard captionStart.isFinite, captionDuration.isFinite, cropZoom.isFinite, cropPosition.isFinite, captionDuration > 0,
+                  cropZoom >= 1, cropZoom <= 1.5, cropPosition >= 0, cropPosition <= 1,
+                  rebase(&segment, media: media, start: start, duration: duration) else { return nil }
+            let finalCaptionStart = min(max(0, captionStart), max(0, segment.duration - 0.05))
+            let finalCaptionDuration = min(captionDuration, segment.duration - finalCaptionStart)
             guard finalCaptionDuration > 0 else { return nil }
-            if let currentCaptions = segment.captions {
-                segment.captions = currentCaptions.compactMap { cue in
-                    let absoluteStart = oldSourceStart + cue.start
-                    let absoluteEnd = absoluteStart + cue.duration
-                    let clippedStart = max(finalStart, absoluteStart)
-                    let clippedEnd = min(finalEnd, absoluteEnd)
-                    guard clippedEnd > clippedStart else { return nil }
-                    return TimedCaption(text: cue.text, start: clippedStart - finalStart, duration: clippedEnd - clippedStart)
-                }
-            }
-            segment.speechWords = absoluteWords.compactMap { word in
-                let end = word.start + word.duration
-                guard word.start >= finalStart - 0.01, end <= finalEnd + 0.01 else { return nil }
-                return TimedSpeechWord(text: word.text, start: word.start - finalStart, duration: word.duration)
-            }
-            if let currentPath = segment.cropKeyframes, !currentPath.isEmpty {
-                let points = currentPath.map { CropKeyframe(time: oldSourceStart + $0.time, position: $0.position, isSceneCut: $0.isSceneCut, preserveWholeFrame: $0.preserveWholeFrame) }.sorted { $0.time < $1.time }
-                func position(at time: Double) -> Double? {
-                    guard let first = points.first, let last = points.last else { return nil }
-                    if time <= first.time { return first.position }
-                    if time >= last.time { return last.position }
-                    guard let rightIndex = points.firstIndex(where: { $0.time >= time }), rightIndex > 0 else { return nil }
-                    let left = points[rightIndex - 1]
-                    let right = points[rightIndex]
-                    if right.isSceneCut == true && time < right.time { return left.position }
-                    let fraction = (time - left.time) / max(0.001, right.time - left.time)
-                    return left.position + (right.position - left.position) * fraction
-                }
-                var rebased = points.compactMap { point -> CropKeyframe? in
-                    guard point.time > finalStart, point.time < finalEnd else { return nil }
-                    return .init(time: point.time - finalStart, position: point.position, isSceneCut: point.isSceneCut, preserveWholeFrame: point.preserveWholeFrame)
-                }
-                if let firstPosition = position(at: finalStart) { rebased.insert(.init(time: 0, position: firstPosition), at: 0) }
-                if let lastPosition = position(at: finalEnd) { rebased.append(.init(time: finalDuration, position: lastPosition)) }
-                segment.cropKeyframes = rebased
-            }
-            segment.start = finalStart
-            segment.duration = finalDuration
             segment.caption = caption
             segment.cropZoom = cropZoom
             segment.cropPosition = cropPosition
             segment.captionStart = finalCaptionStart
             segment.captionDuration = finalCaptionDuration
-            return abs(finalStart - start) > 0.005 || abs(finalDuration - duration) > 0.005
-                ? "Clip changes saved on complete speech boundaries (\(formatSeconds(finalDuration)))."
+            return abs(segment.start - start) > 0.005 || abs(segment.duration - duration) > 0.005
+                ? "Clip changes saved on complete speech boundaries (\(formatSeconds(segment.duration)))."
                 : "Clip changes saved."
         }) { message = reply }
         else { message = "Choose valid clip and text ranges within the source and clip duration." }
+    }
+
+    /// Moves a Short to a new source range without cutting a spoken word, carrying its captions, word timings
+    /// and focus path along so they stay on the same moments. False when the range is invalid.
+    private func rebase(_ segment: inout EditSegment, media: MediaItem, start: Double, duration: Double) -> Bool {
+        guard start.isFinite, duration.isFinite, start >= 0, duration > 0, start + duration <= media.duration + 0.001 else { return false }
+        let oldSourceStart = segment.start
+        let absoluteWords = (segment.speechWords ?? []).map {
+            TimedSpeechWord(text: $0.text, start: oldSourceStart + $0.start, duration: $0.duration)
+        }
+        var finalStart = start
+        if let cutWord = absoluteWords.first(where: { $0.start + 0.02 < finalStart && $0.start + $0.duration - 0.02 > finalStart }) {
+            finalStart = max(0, cutWord.start)
+        }
+        var finalEnd = min(media.duration, finalStart + duration)
+        if let cutWord = absoluteWords.first(where: { $0.start + 0.02 < finalEnd && $0.start + $0.duration - 0.02 > finalEnd }) {
+            let wordEnd = cutWord.start + cutWord.duration
+            finalEnd = wordEnd <= media.duration ? wordEnd + 0.04 : max(finalStart + 0.1, cutWord.start)
+            finalEnd = min(media.duration, finalEnd)
+        }
+        let finalDuration = finalEnd - finalStart
+        guard finalDuration > 0 else { return false }
+        if let currentCaptions = segment.captions {
+            segment.captions = currentCaptions.compactMap { cue in
+                let absoluteStart = oldSourceStart + cue.start
+                let absoluteEnd = absoluteStart + cue.duration
+                let clippedStart = max(finalStart, absoluteStart)
+                let clippedEnd = min(finalEnd, absoluteEnd)
+                guard clippedEnd > clippedStart else { return nil }
+                return TimedCaption(text: cue.text, start: clippedStart - finalStart, duration: clippedEnd - clippedStart)
+            }
+        }
+        segment.speechWords = absoluteWords.compactMap { word in
+            let end = word.start + word.duration
+            guard word.start >= finalStart - 0.01, end <= finalEnd + 0.01 else { return nil }
+            return TimedSpeechWord(text: word.text, start: word.start - finalStart, duration: word.duration)
+        }
+        if let currentPath = segment.cropKeyframes, !currentPath.isEmpty {
+            let points = currentPath.map { CropKeyframe(time: oldSourceStart + $0.time, position: $0.position, isSceneCut: $0.isSceneCut, preserveWholeFrame: $0.preserveWholeFrame) }.sorted { $0.time < $1.time }
+            func position(at time: Double) -> Double? {
+                guard let first = points.first, let last = points.last else { return nil }
+                if time <= first.time { return first.position }
+                if time >= last.time { return last.position }
+                guard let rightIndex = points.firstIndex(where: { $0.time >= time }), rightIndex > 0 else { return nil }
+                let left = points[rightIndex - 1]
+                let right = points[rightIndex]
+                if right.isSceneCut == true && time < right.time { return left.position }
+                let fraction = (time - left.time) / max(0.001, right.time - left.time)
+                return left.position + (right.position - left.position) * fraction
+            }
+            var rebased = points.compactMap { point -> CropKeyframe? in
+                guard point.time > finalStart, point.time < finalEnd else { return nil }
+                return .init(time: point.time - finalStart, position: point.position, isSceneCut: point.isSceneCut, preserveWholeFrame: point.preserveWholeFrame)
+            }
+            // New end points keep the neighboring whole-frame flag, or a trimmed Fit-style path would zoom in at its edges.
+            func wholeFrame(at time: Double) -> Bool? { (points.last { $0.time <= time } ?? points.first)?.preserveWholeFrame }
+            if let firstPosition = position(at: finalStart) {
+                rebased.insert(.init(time: 0, position: firstPosition, preserveWholeFrame: wholeFrame(at: finalStart)), at: 0)
+            }
+            if let lastPosition = position(at: finalEnd) {
+                rebased.append(.init(time: finalDuration, position: lastPosition, preserveWholeFrame: wholeFrame(at: finalEnd)))
+            }
+            segment.cropKeyframes = rebased
+        }
+        segment.start = finalStart
+        segment.duration = finalDuration
+        return true
     }
 
     func adjustCropKeyframe(from sourceTime: Double, to targetTime: Double, position: Double, insert: Bool) {
@@ -1065,23 +1243,26 @@ final class AppModel {
         guard sourceTime.isFinite, targetTime.isFinite, position.isFinite,
               targetTime >= 0, targetTime <= activeSegment.duration, position >= 0, position <= 1 else { return }
         _ = applyEdit { segment, _ in
-            var points = segment.cropKeyframes ?? [
-                CropKeyframe(time: 0, position: segment.cropPosition ?? 0.5),
-                CropKeyframe(time: segment.duration, position: segment.cropPosition ?? 0.5)
-            ]
+            // Path points are stored without the tracking offset (cropPosition − 0.5) that preview, export and the
+            // focus track add on top, so the offset is taken off the clicked position and the starting points sit at 0.5.
+            let stored = position - ((segment.cropPosition ?? 0.5) - 0.5)
+            var points = segment.cropKeyframes ?? [CropKeyframe(time: 0, position: 0.5), CropKeyframe(time: segment.duration, position: 0.5)]
             if insert {
                 if let nearest = points.indices.min(by: { abs(points[$0].time - targetTime) < abs(points[$1].time - targetTime) }),
                    abs(points[nearest].time - targetTime) < 0.18 {
-                    points[nearest].position = position
+                    points[nearest].position = stored
                 } else {
-                    points.append(.init(time: targetTime, position: position))
+                    points.append(.init(time: targetTime, position: stored))
                 }
             } else if let nearest = points.indices.min(by: { abs(points[$0].time - sourceTime) < abs(points[$1].time - sourceTime) }) {
-                points[nearest] = .init(time: targetTime, position: position)
+                points[nearest].time = targetTime
+                points[nearest].position = stored
             }
+            // Scene cuts and whole-frame shots stay marked; dropping them turned cuts into pans.
             points = points
                 .filter { $0.time.isFinite && $0.position.isFinite }
-                .map { .init(time: min(segment.duration, max(0, $0.time)), position: min(1, max(0, $0.position))) }
+                .map { .init(time: min(segment.duration, max(0, $0.time)), position: min(1, max(0, $0.position)),
+                             isSceneCut: $0.isSceneCut, preserveWholeFrame: $0.preserveWholeFrame) }
                 .sorted { $0.time < $1.time }
             var unique: [CropKeyframe] = []
             for point in points {
@@ -1171,6 +1352,10 @@ final class AppModel {
                 let command = try await GeminiSelection.interpret(text, summary: summary, conversation: conversation, configuration: configuration)
                 isBusy = false
                 executeAICommand(command, originalRequest: text)
+                if let note = modelFallbackNote {
+                    modelFallbackNote = nil
+                    chatMessages.append(.init(isUser: false, text: note))
+                }
                 return
             } catch {
                 isBusy = false
@@ -1200,11 +1385,18 @@ final class AppModel {
             chatMessages.append(.init(isUser: false, text: reply ?? "I couldn't apply that overlay."))
         case "TRIM":
             guard let duration = value(0) else { handleFallback(originalRequest); return }
-            let reply = applyEdit { segment, video in segment.duration = max(0.25, min(duration, video.duration - segment.start)); return "\(editingAIName) trimmed the edit to \(formatSeconds(segment.duration))." }
+            let reply = applyEdit { segment, video in
+                rebase(&segment, media: video, start: segment.start, duration: max(0.25, min(duration, video.duration - segment.start)))
+                    ? "\(editingAIName) trimmed the edit to \(formatSeconds(segment.duration))." : nil
+            }
             chatMessages.append(.init(isUser: false, text: reply ?? "I couldn't trim the edit."))
         case "START":
             guard let start = value(0) else { handleFallback(originalRequest); return }
-            let reply = applyEdit { segment, video in segment.start = max(0, min(start, video.duration - 0.25)); segment.duration = min(segment.duration, video.duration - segment.start); return "\(editingAIName) moved the edit to \(formatSeconds(segment.start))." }
+            let reply = applyEdit { segment, video in
+                let newStart = max(0, min(start, video.duration - 0.25))
+                return rebase(&segment, media: video, start: newStart, duration: min(segment.duration, video.duration - newStart))
+                    ? "\(editingAIName) moved the edit to \(formatSeconds(segment.start))." : nil
+            }
             chatMessages.append(.init(isUser: false, text: reply ?? "I couldn't move the edit."))
         case "SHORT": makeShort(requestedDuration: value(0))
         case "SUBTITLES":
@@ -1225,7 +1417,7 @@ final class AppModel {
         case "REMOVE_TEXT":
             let reply = applyEdit { segment, _ in segment.caption = ""; segment.captions = []; segment.captionStart = 0; segment.captionDuration = nil; return "\(editingAIName) removed the text overlay and speech subtitles." }
             chatMessages.append(.init(isUser: false, text: reply ?? "I couldn't remove the text."))
-        case "EXPORT": chatMessages.append(.init(isUser: false, text: "\(editingAIName) is exporting the current edit.")); export()
+        case "EXPORT": chatMessages.append(.init(isUser: false, text: "\(editingAIName) is exporting every Short to Downloads.")); exportAll()
         case "UNDO":
             chatMessages.append(.init(isUser: false, text: undoEdit()))
         case "CHAT":
@@ -1278,7 +1470,8 @@ final class AppModel {
             chatMessages.append(.init(isUser: false, text: reply ?? "I couldn't change the captions."))
         } else if request.contains("caption to ") || request.contains("text to ") {
             let marker = request.contains("caption to ") ? "caption to " : "text to "
-            let caption = String(text[text.lowercased().range(of: marker)!.upperBound...]).trimmingCharacters(in: CharacterSet(charactersIn: " \"“”'"))
+            let caption = (text.range(of: marker, options: .caseInsensitive).map { String(text[$0.upperBound...]) } ?? "")
+                .trimmingCharacters(in: CharacterSet(charactersIn: " \"“”'"))
             let reply = caption.isEmpty ? nil : applyEdit { segment, _ in segment.caption = caption; segment.captionStart = 0; segment.captionDuration = segment.duration; return "Done — I changed the on-screen caption to “\(caption)”." }
             chatMessages.append(.init(isUser: false, text: reply ?? "Tell me the caption text after “caption to”."))
         } else if request.contains("unmute") || request.contains("restore audio") {
@@ -1290,16 +1483,16 @@ final class AppModel {
         } else if request.contains("start at") || request.contains("begin at") {
             let value = number(in: request, after: ["start at", "begin at"])
             let reply = value.flatMap { newStart in applyEdit { segment, video in
-                segment.start = max(0, min(newStart, max(0, video.duration - 0.25)))
-                segment.duration = min(segment.duration, video.duration - segment.start)
-                return "Done — the edit now starts at \(formatSeconds(segment.start))."
+                let start = max(0, min(newStart, max(0, video.duration - 0.25)))
+                return rebase(&segment, media: video, start: start, duration: min(segment.duration, video.duration - start))
+                    ? "Done — the edit now starts at \(formatSeconds(segment.start))." : nil
             }}
             chatMessages.append(.init(isUser: false, text: reply ?? "Tell me a start time, for example “start at 12 seconds”."))
         } else if request.contains("make it") || request.contains("trim to") || request.contains("duration") {
             let value = number(in: request, after: ["make it", "trim to", "duration"])
             let reply = value.flatMap { newDuration in applyEdit { segment, video in
-                segment.duration = max(0.25, min(newDuration, video.duration - segment.start))
-                return "Done — I trimmed the edit to \(formatSeconds(segment.duration))."
+                rebase(&segment, media: video, start: segment.start, duration: max(0.25, min(newDuration, video.duration - segment.start)))
+                    ? "Done — I trimmed the edit to \(formatSeconds(segment.duration))." : nil
             }}
             chatMessages.append(.init(isUser: false, text: reply ?? "Tell me a duration, for example “make it 20 seconds”."))
         } else if request.contains("short") || request.contains("analy") || request.contains("best moment") {
@@ -1307,10 +1500,10 @@ final class AppModel {
             makeShort(requestedDuration: number(in: request, after: ["short", "make", "create"]))
         } else if request.contains("export") {
             let reply = project?.segments.isEmpty == false
-                ? "I’m exporting the current edit as an MP4 into this project's Exports folder."
+                ? "I’m exporting every Short as an MP4 to Downloads › Prism."
                 : "Create a Short first, then I can prepare it for export."
             chatMessages.append(.init(isUser: false, text: reply))
-            if project?.segments.isEmpty == false { export() }
+            if project?.segments.isEmpty == false { exportAll() }
         } else if request.contains("caption") {
             let reply: String
             if let segment = project?.segments.first {
@@ -1432,6 +1625,9 @@ struct ContentView: View {
     @State private var renameText = ""
     @State private var deleteProjectPath: String?
     @State private var statsProject: ProjectPath?
+    /// The export card's Shorts list height, measured so a short list leaves no empty space.
+    @State var exportListHeight: CGFloat = 0
+    @FocusState private var keyFieldFocused: Bool
     @AppStorage(PrismAppearance.storageKey) var appearance = PrismAppearance.dark
     @AppStorage("editor.leftSidebarWidth") var leftSidebarWidth = 248.0
     @AppStorage("editor.rightSidebarWidth") var rightSidebarWidth = 282.0
@@ -1469,9 +1665,63 @@ struct ContentView: View {
             if model.screen == .editor, let progress = model.generationProgress { generationOverlay(progress) }
             else if model.screen == .editor, let error = model.generationError { generationErrorOverlay(error) }
             else if model.screen == .editor, let summary = model.exportSummary { exportDoneOverlay(summary) }
+            else if model.screen == .editor, let choice = model.exportChoice { exportChoiceOverlay(choice) }
         }
+        .overlay { if !model.isGeminiKeySaved { apiKeyGate } }
         .tint(Prism.accent)
         .animation(.easeInOut(duration: 0.2), value: sidebarCollapsed)
+    }
+    /// Prism can't do anything without Gemini, so while no key is saved this card covers the whole app and blocks it.
+    var apiKeyGate: some View {
+        ZStack {
+            Color.black.opacity(0.72).contentShape(Rectangle()).onTapGesture {}
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(spacing: 10) {
+                    PrismMark().frame(height: 26)
+                    Text("Welcome to Prism").font(Prism.display(22))
+                }
+                Text("Prism uses Google Gemini to find, cut, caption and frame your Shorts, so it needs your own Gemini API key before it can work. Google bills your AI Studio account for what Prism uses; the free tier works too.")
+                    .font(Prism.text(13)).foregroundStyle(Prism.textSecondary).fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("1. Create a key").font(Prism.text(13, .medium))
+                    Link("Open Google AI Studio › API keys", destination: URL(string: "https://aistudio.google.com/apikey")!)
+                        .font(Prism.text(13))
+                    Text("2. Paste it here").font(Prism.text(13, .medium)).padding(.top, 6)
+                    HStack(spacing: 10) {
+                        Image(systemName: "key.fill").foregroundStyle(Prism.textSecondary)
+                        SecureField("Paste your API key", text: $model.geminiKey)
+                            .textFieldStyle(.plain)
+                            .focused($keyFieldFocused)
+                            .onSubmit { model.verifyAndSaveGeminiKey() }
+                            .accessibilityLabel("Gemini API key")
+                    }
+                    .padding(11)
+                    .background(Prism.surface2, in: RoundedRectangle(cornerRadius: 12))
+                    .disabled(model.isTestingGemini)
+                }
+                if !model.geminiKeyStatus.isEmpty {
+                    Label(model.geminiKeyStatus, systemImage: model.geminiKeyRejected ? "exclamationmark.triangle" : "info.circle")
+                        .font(Prism.text(12)).foregroundStyle(model.geminiKeyRejected ? Prism.amber : Prism.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text("The key stays in your Mac’s Keychain. Audio, transcripts and sampled frames from your videos are sent to Google.")
+                    .font(Prism.text(11)).foregroundStyle(Prism.textSecondary).fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Spacer()
+                    if model.isTestingGemini { ProgressView().controlSize(.small) }
+                    Button("Save and continue") { model.verifyAndSaveGeminiKey() }
+                        .buttonStyle(.prismPrimary).keyboardShortcut(.defaultAction)
+                        .disabled(model.geminiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.isTestingGemini)
+                }
+            }
+            .padding(28)
+            .frame(width: 500)
+            .background(Prism.surface1, in: RoundedRectangle(cornerRadius: 16))
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(Prism.border))
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Add your Gemini API key")
+        }
+        .onAppear { keyFieldFocused = true }
     }
     /// Fills the app window (not macOS full screen), so it opens and closes instantly.
     func expandedPlayer(_ player: AVPlayer) -> some View {
@@ -1652,7 +1902,7 @@ struct ContentView: View {
                                 if model.isEditingGeminiKey {
                                     Button("Cancel") { model.cancelGeminiKeyEdit() }
                                         .buttonStyle(.borderless)
-                                    Button("Save") { model.saveGeminiKey() }
+                                    Button("Save") { model.verifyAndSaveGeminiKey() }
                                         .buttonStyle(.prismPrimary)
                                         .disabled(model.geminiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.isTestingGemini)
                                 } else {
@@ -1678,7 +1928,7 @@ struct ContentView: View {
                                 Image(systemName: "key.fill").foregroundStyle(Prism.textSecondary)
                                 SecureField("Paste your API key", text: $model.geminiKey)
                                     .textFieldStyle(.plain)
-                                Button("Save key") { model.saveGeminiKey() }
+                                Button("Save key") { model.verifyAndSaveGeminiKey() }
                                     .buttonStyle(.prismPrimary)
                                     .disabled(model.geminiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.isTestingGemini)
                             }
@@ -1957,7 +2207,7 @@ struct ContentView: View {
         }
     }
     func beginRename(_ path: String) {
-        let stored = try? ProjectStore(root: URL(fileURLWithPath: path)).load(ProjectData.self, key: "project")
+        let stored = try? ProjectStore(root: URL(fileURLWithPath: path), create: false).load(ProjectData.self, key: "project")
         renameText = stored?.displayTitle ?? URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
         renameProjectPath = path
     }
@@ -1990,7 +2240,7 @@ struct ContentView: View {
         await Task.detached(priority: .utility) {
             var counts: [String: Int] = [:]
             for path in paths {
-                guard let store = try? ProjectStore(root: URL(fileURLWithPath: path)),
+                guard let store = try? ProjectStore(root: URL(fileURLWithPath: path), create: false),
                       let project = try? store.load(ProjectData.self, key: "project") else { continue }
                 counts[path] = project.segments.count
             }
@@ -2377,7 +2627,7 @@ private struct ProjectStatsView: View {
         let projectPath = path
         let loaded = await Task.detached(priority: .utility) { () -> ProjectStats? in
             let root = URL(fileURLWithPath: projectPath)
-            guard let project = try? ProjectStore(root: root).load(ProjectData.self, key: "project") else { return nil }
+            guard let project = try? ProjectStore(root: root, create: false).load(ProjectData.self, key: "project") else { return nil }
             let video = project.media.first(where: { $0.kind == "video" })
             let manager = FileManager.default
             let exports = (try? manager.contentsOfDirectory(at: root.appendingPathComponent("Exports"), includingPropertiesForKeys: nil)) ?? []
@@ -2486,7 +2736,7 @@ private struct RecentProjectCard: View {
         let projectPath = path
         let loaded = await Task.detached(priority: .utility) { () -> RecentProjectSummary in
             let root = URL(fileURLWithPath: projectPath)
-            guard let store = try? ProjectStore(root: root),
+            guard let store = try? ProjectStore(root: root, create: false),
                   let project = try? store.load(ProjectData.self, key: "project") else {
                 return RecentProjectSummary(title: root.deletingPathExtension().lastPathComponent, duration: nil, shortCount: 0, created: nil, poster: nil)
             }

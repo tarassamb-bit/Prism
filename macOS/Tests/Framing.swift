@@ -23,6 +23,16 @@ import AppKit
         let cuts = SubjectFramer.plan(cutSamples, duration: 2, imageSize: size, zoom: 1.08)
         let cut = cuts.first { $0.isSceneCut == true }!
         precondition(cut.time == 0.95 && cut.position > 0.85, "New shot was averaged with the previous shot")
+        // A move between two holds eases in and out; a continuous move doesn't stop at its middle keyframe; no overshoot.
+        let move = SubjectFramer.eased([.init(time: 0, position: 0.2), .init(time: 1, position: 0.2), .init(time: 2, position: 0.8), .init(time: 3, position: 0.8)])
+        let third = move.first { abs($0.time - 4.0 / 3) < 0.001 }!.position
+        precondition(third > 0.2 && third < 0.4 && move.allSatisfy { (0.2...0.8).contains($0.position) }
+                     && zip(move, move.dropFirst()).allSatisfy { $0.position <= $1.position + 1e-9 }, "Moves must ease in, stay monotone and not overshoot")
+        let glide = SubjectFramer.eased([.init(time: 0, position: 0.1), .init(time: 1, position: 0.4), .init(time: 2, position: 0.7)])
+        let before = glide.first { abs($0.time - 2.0 / 3) < 0.001 }!.position, after = glide.first { abs($0.time - 4.0 / 3) < 0.001 }!.position
+        precondition((0.4 - before) > 0.05 && (after - 0.4) > 0.05, "A continuous move must keep its speed through a keyframe")
+        let hard = SubjectFramer.eased([.init(time: 0, position: 0.1), .init(time: 1, position: 0.9, isSceneCut: true), .init(time: 2, position: 0.9)])
+        precondition(hard.count == 3, "Scene cuts must stay hard cuts")
         let legacy = try JSONDecoder().decode(CropKeyframe.self, from: Data("{\"time\":0,\"position\":0.5}".utf8))
         precondition(legacy.isSceneCut == nil)
         print("PASS steady framing, fast subject containment, scene cut isolation, legacy projects")

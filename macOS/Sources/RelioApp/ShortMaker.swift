@@ -3,6 +3,7 @@ import AVFoundation
 import CryptoKit
 import AppKit
 import CoreImage
+import os
 
 struct ShortResult {
     let start: Double
@@ -105,9 +106,20 @@ enum ShortMaker {
             generationProgress(0.55, "Using the saved transcript")
             transcript = saved
         } else {
-            transcript = try await GeminiSelection.transcribeSentences(url: url, interval: interval, configuration: gemini, progress: { fraction in
-                generationProgress(0.55 * fraction, "Gemini · transcribing audio · \(Int(fraction * 100))%")
+            // An earlier run that failed partway saved the stretch it finished; only the rest is transcribed again.
+            let resumed = cachedTranscript.flatMap { saved -> SentenceTranscript? in
+                guard saved.start <= interval.start + 0.01, saved.end > interval.start + 1, saved.end < interval.end else { return nil }
+                return saved.cues(covering: (interval.start, saved.end)).map { SentenceTranscript(start: interval.start, end: saved.end, cues: $0) }
+            }
+            let from = resumed?.end ?? interval.start
+            let kept = resumed?.cues ?? []
+            let fresh = try await GeminiSelection.transcribeSentences(url: url, interval: (from, interval.end), configuration: gemini, progress: { fraction in
+                let overall = (from - interval.start + fraction * (interval.end - from)) / (interval.end - interval.start)
+                generationProgress(0.55 * overall, "Gemini · transcribing audio · \(Int(overall * 100))%")
+            }, finished: { cues, end in
+                onTranscript(SentenceTranscript(start: interval.start, end: end, cues: kept + cues))
             })
+            transcript = kept + fresh
             onTranscript(SentenceTranscript(start: interval.start, end: interval.end, cues: transcript))
         }
         generationProgress(0.55, "Selecting distinct moments")
@@ -127,56 +139,43 @@ enum ShortMaker {
         var planned = clips.map { (start: $0.start, duration: $0.end - $0.start, fit: $0.layout == "fit", title: $0.title, reason: $0.reason) }
         // Screens and gameplay lose their edges in a vertical crop, whatever the picker suggested.
         if videoType.forcesFit { planned = planned.map { ($0.start, $0.duration, true, $0.title, $0.reason) } }
-        var results: [ShortResult] = []
-        var wordAlignmentAvailable = true
+        let picks = planned
         let sentenceTimingNote = GeminiSelection.sentenceTimingNotice
-        for candidate in planned {
+        let finished = OSAllocatedUnfairLock(initialState: 0)
+        let reportStep: @Sendable (String) -> Void = { stage in
+            let done = finished.withLock { $0 += 1; return $0 }
+            generationProgress(0.70 + 0.29 * min(1, Double(done) / Double(targetCount * 2)), stage)
+        }
+        // Picks are prepared a wave at a time, side by side: exact boundaries, word timing and the nearest pauses.
+        // They are accepted in Gemini's order; a pick that now overlaps an earlier one gives way to the next backup.
+        var accepted: [(candidate: Int, range: PreparedShort)] = []
+        var wordAlignmentAvailable = true
+        var next = 0
+        while accepted.count < targetCount, next < planned.count {
             try Task.checkCancellation()
-            let phraseCut = TranscriptSelection.phraseRange(start: candidate.start, duration: candidate.duration,
-                                                           cues: transcript, interval: interval)
-            // Cloud cues are whole sentences, so a Short never starts or stops in the middle of one.
-            let whole = TranscriptSelection.completeSentences(
-                start: phraseCut.start, duration: phraseCut.duration, cues: transcript, interval: interval,
-                minDuration: max(1, clipDuration * 0.65), maxDuration: min(90, clipDuration * 1.5))
-            let snapped = TranscriptSelection.trimmedFiller(start: whole.start, duration: whole.duration, cues: transcript,
-                                                            minDuration: max(1, clipDuration * 0.65))
-            let phrase = TranscriptSelection.paddedPhraseRange(start: snapped.start, duration: snapped.duration,
-                                                               cues: transcript, interval: interval)
-            let referenceCues = transcript.filter { cue in
-                let middle = cue.start + cue.duration / 2
-                return middle >= snapped.start && middle <= snapped.start + snapped.duration
+            let wave = Array(next..<min(planned.count, next + targetCount - accepted.count))
+            next += wave.count
+            let aligning = wordAlignmentAvailable
+            let prepared = try await concurrentMap(wave) { index in
+                let candidate = picks[index]
+                let shot = try await prepareShort(url: url, start: candidate.start, duration: candidate.duration, transcript: transcript,
+                                                  interval: interval, clipDuration: clipDuration, aligning: aligning, gemini: gemini)
+                reportStep("Aligning speech and pauses · Short \(index + 1)")
+                return (index, shot)
             }
-            var clipWords: [TimedSpeechWord]
-            var alignmentWarning: String?
-            if !referenceCues.isEmpty, wordAlignmentAvailable {
-                generationProgress(0.70 + 0.29 * Double(results.count) / Double(targetCount), "Aligning speech · Short \(results.count + 1) of \(targetCount)")
-                do {
-                    let proposed = try await GeminiSelection.transcribe(url: url,
-                        interval: (max(interval.start, phrase.start - 0.5), min(interval.end, phrase.start + phrase.duration + 0.5)),
-                        configuration: gemini, reference: referenceCues)
-                    let inside = proposed.filter { $0.start >= phrase.start - 0.01 && $0.start + $0.duration <= phrase.start + phrase.duration + 0.01 }
-                    if TranscriptSelection.alignmentIsReliable(inside, reference: referenceCues) {
-                        clipWords = inside
-                    } else {
-                        clipWords = []
-                        alignmentWarning = sentenceTimingNote
-                    }
-                } catch {
-                    try Task.checkCancellation()
-                    wordAlignmentAvailable = false
-                    clipWords = []
-                    alignmentWarning = sentenceTimingNote
-                }
-            } else {
-                clipWords = []
-                if !referenceCues.isEmpty { alignmentWarning = sentenceTimingNote }
+            for (index, shot) in prepared {
+                if shot.alignmentFailed { wordAlignmentAvailable = false }
+                guard excluding.allSatisfy({ !TranscriptSelection.overlaps(start: shot.start, duration: shot.duration, otherStart: $0.start, otherDuration: $0.end - $0.start) }),
+                      accepted.allSatisfy({ !TranscriptSelection.overlaps(start: shot.start, duration: shot.duration, otherStart: $0.range.start, otherDuration: $0.range.duration) })
+                else { continue }
+                accepted.append((index, shot))
+                if accepted.count == targetCount { break }
             }
-            let range = speechSafeRange(start: phrase.start, duration: phrase.duration, words: clipWords, interval: interval)
-            let start = range.start
-            let actualDuration = range.duration
-            guard excluding.allSatisfy({ !TranscriptSelection.overlaps(start: start, duration: actualDuration, otherStart: $0.start, otherDuration: $0.end - $0.start) }) else { continue }
-            guard results.allSatisfy({ !TranscriptSelection.overlaps(start: start, duration: actualDuration, otherStart: $0.start, otherDuration: $0.duration) }) else { continue }
-            let captionSource = !clipWords.isEmpty ? GeminiSelection.captionCues(clipWords, interval: (start, start + actualDuration)) : TranscriptSelection.sentenceCaptionGroups(referenceCues)
+        }
+        let results: [ShortResult] = try await concurrentMap(accepted) { candidateIndex, shot in
+            let candidate = picks[candidateIndex]
+            let start = shot.start, actualDuration = shot.duration
+            let captionSource = !shot.words.isEmpty ? GeminiSelection.captionCues(shot.words, interval: (start, start + actualDuration)) : TranscriptSelection.sentenceCaptionGroups(shot.referenceCues)
             let captions = captionSource.compactMap { cue -> TimedCaption? in
                 let cueEnd = cue.start + cue.duration
                 let clipEnd = start + actualDuration
@@ -185,23 +184,19 @@ enum ShortMaker {
                 let clippedEnd = min(actualDuration, cueEnd - start)
                 return TimedCaption(text: cue.text, start: clippedStart, duration: max(0.15, clippedEnd - clippedStart))
             }
-            let words = clipWords.compactMap { word -> TimedSpeechWord? in
+            let words = shot.words.compactMap { word -> TimedSpeechWord? in
                 guard word.start >= start - 0.01, word.start + word.duration <= start + actualDuration + 0.01 else { return nil }
                 return .init(text: word.text, start: word.start - start, duration: word.duration)
             }
-            let completedClips = results.count
-            let cropKeyframes: [CropKeyframe] = candidate.fit ? [.init(time: 0, position: 0.5, preserveWholeFrame: true), .init(time: actualDuration, position: 0.5, preserveWholeFrame: true)] : await SubjectFramer.analyze(url, start: start, duration: actualDuration, zoom: 1.08, configuration: gemini, progress: { fraction in
-                generationProgress(0.70 + 0.29 * (Double(completedClips) + fraction) / Double(targetCount), "Gemini · framing the subject · Short \(completedClips + 1) of \(targetCount)")
-            })
-            let resultWarning = alignmentWarning
-            let resultTitle = candidate.title.map { String($0.prefix(100)) } ?? captions.first.map { String($0.text.prefix(100)) }
-            var notes: [String] = []
-            if let reason = candidate.reason { notes.append(String(reason.prefix(400))) }
-            let result = ShortResult(start: start, duration: actualDuration, caption: "", captions: captions,
-                cropKeyframes: cropKeyframes, speechWords: words, analysisWarning: resultWarning,
-                suggestedTitle: resultTitle, selectionReason: notes.isEmpty ? nil : notes.joined(separator: "\n\n"), fitToFrame: candidate.fit)
-            results.append(result)
-            if results.count == targetCount { break }
+            let cropKeyframes: [CropKeyframe] = candidate.fit
+                ? [.init(time: 0, position: 0.5, preserveWholeFrame: true), .init(time: actualDuration, position: 0.5, preserveWholeFrame: true)]
+                : await SubjectFramer.analyze(url, start: start, duration: actualDuration, zoom: 1.08, configuration: gemini, speech: captions)
+            reportStep("Gemini · framing the subject")
+            let warning = shot.referenceCues.isEmpty || !shot.words.isEmpty ? nil : sentenceTimingNote
+            let title = candidate.title.map { String($0.prefix(100)) } ?? captions.first.map { String($0.text.prefix(100)) }
+            return ShortResult(start: start, duration: actualDuration, caption: "", captions: captions,
+                cropKeyframes: cropKeyframes, speechWords: words, analysisWarning: warning,
+                suggestedTitle: title, selectionReason: candidate.reason.map { String($0.prefix(400)) }, fitToFrame: candidate.fit)
         }
         if results.isEmpty {
             // Returning the beginning of the source here made a failed analysis
@@ -214,6 +209,143 @@ enum ShortMaker {
         try Task.checkCancellation()
         generationProgress(1, "Shorts ready")
         return results.sorted { $0.start < $1.start }
+    }
+
+    /// A pick's final source range with the word timing and sentence captions found for it.
+    struct PreparedShort: Sendable {
+        let start: Double
+        let duration: Double
+        let words: [TimedSpeechWord]
+        let referenceCues: [TimedCaption]
+        let alignmentFailed: Bool
+    }
+
+    /// Turns Gemini's rough clip into exact boundaries: whole sentences, no filler at the edges, a little breathing room,
+    /// no cut word, and both ends moved into the nearest pause in the audio.
+    static func prepareShort(url: URL, start: Double, duration: Double, transcript: [TimedCaption], interval: (start: Double, end: Double),
+                             clipDuration: Double, aligning: Bool, gemini: GeminiConfiguration) async throws -> PreparedShort {
+        let phraseCut = TranscriptSelection.phraseRange(start: start, duration: duration, cues: transcript, interval: interval)
+        // Cloud cues are whole sentences, so a Short never starts or stops in the middle of one.
+        let sentences = TranscriptSelection.completeSentences(
+            start: phraseCut.start, duration: phraseCut.duration, cues: transcript, interval: interval,
+            minDuration: max(1, clipDuration * 0.65), maxDuration: min(90, clipDuration * 1.5))
+        let snapped = TranscriptSelection.trimmedFiller(start: sentences.start, duration: sentences.duration, cues: transcript,
+                                                        minDuration: max(1, clipDuration * 0.65))
+        let phrase = TranscriptSelection.paddedPhraseRange(start: snapped.start, duration: snapped.duration, cues: transcript, interval: interval)
+        let referenceCues = transcript.filter { cue in
+            let middle = cue.start + cue.duration / 2
+            return middle >= snapped.start && middle <= snapped.start + snapped.duration
+        }
+        var clipWords: [TimedSpeechWord] = []
+        var alignmentFailed = false
+        if !referenceCues.isEmpty, aligning {
+            do {
+                let proposed = try await GeminiSelection.transcribe(url: url,
+                    interval: (max(interval.start, phrase.start - 0.5), min(interval.end, phrase.start + phrase.duration + 0.5)),
+                    configuration: gemini, reference: referenceCues)
+                let inside = proposed.filter { $0.start >= phrase.start - 0.01 && $0.start + $0.duration <= phrase.start + phrase.duration + 0.01 }
+                if TranscriptSelection.alignmentIsReliable(inside, reference: referenceCues) { clipWords = inside }
+            } catch {
+                try Task.checkCancellation()
+                alignmentFailed = true
+            }
+        }
+        let whole = speechSafeRange(start: phrase.start, duration: phrase.duration, words: clipWords, interval: interval)
+        let safe = strongOpening(start: whole.start, duration: whole.duration, words: clipWords, minDuration: max(1, clipDuration * 0.65))
+        let quiet = await silenceSnapped(url: url, start: safe.start, duration: safe.duration, interval: interval, words: clipWords)
+        return PreparedShort(start: quiet.start, duration: quiet.duration, words: clipWords, referenceCues: referenceCues, alignmentFailed: alignmentFailed)
+    }
+
+    /// Runs `transform` on every item, at most `limit` at a time, and returns the results in the items' order.
+    static func concurrentMap<T: Sendable, R: Sendable>(_ items: [T], limit: Int = 3,
+                                                        _ transform: @escaping @Sendable (T) async throws -> R) async throws -> [R] {
+        var results = [R?](repeating: nil, count: items.count)
+        try await withThrowingTaskGroup(of: (Int, R).self) { group in
+            var next = 0
+            func startNext() {
+                guard next < items.count else { return }
+                let index = next, item = items[next]
+                next += 1
+                group.addTask { (index, try await transform(item)) }
+            }
+            for _ in 0..<max(1, limit) { startNext() }
+            while let (index, result) = try await group.next() {
+                results[index] = result
+                startNext()
+            }
+        }
+        return results.compactMap { $0 }
+    }
+
+    /// Moves a Short's start and end into the nearest pause in its audio, so it never opens or closes on a clipped sound.
+    /// The start may move up to 0.5 s earlier or 0.15 s later, the end 0.15 s earlier or 0.5 s later, never past `interval`
+    /// or into a timed word. Without audio or a clear pause nearby, the range stays as it is.
+    static func silenceSnapped(url: URL, start: Double, duration: Double, interval: (start: Double, end: Double),
+                               words: [TimedSpeechWord] = []) async -> (start: Double, duration: Double) {
+        let end = start + duration
+        let from = max(interval.start, start - 0.6), to = min(interval.end, end + 0.6)
+        guard to > from, let levels = audioLevels(url: url, from: from, to: to), levels.count > 20 else { return (start, duration) }
+        let frame = 0.01
+        // 50 ms smoothing ignores the tiny gaps inside a word.
+        let smooth = levels.indices.map { index in
+            let window = levels[max(0, index - 2)...min(levels.count - 1, index + 2)]
+            return window.reduce(0, +) / Float(window.count)
+        }
+        let median = smooth.sorted()[smooth.count / 2]
+        let threshold = max(0.003, median * 0.2)
+        func time(_ index: Int) -> Double { from + (Double(index) + 0.5) * frame }
+        func insideWord(_ t: Double) -> Bool { words.contains { $0.start + 0.02 < t && $0.start + $0.duration - 0.02 > t } }
+        func nearestQuiet(to target: Double, from low: Double, to high: Double) -> Double? {
+            smooth.indices.filter { time($0) >= low && time($0) <= high && smooth[$0] <= threshold && !insideWord(time($0)) }
+                .min { abs(time($0) - target) < abs(time($1) - target) }.map(time)
+        }
+        let newStart = nearestQuiet(to: start, from: max(interval.start, start - 0.5), to: start + 0.15) ?? start
+        let newEnd = nearestQuiet(to: end, from: end - 0.15, to: min(interval.end, end + 0.5)) ?? end
+        guard newEnd - newStart > 0.5 else { return (start, duration) }
+        return (newStart, newEnd - newStart)
+    }
+
+    /// Loudness (RMS) of the audio in 10 ms frames, read as 16 kHz mono; nil when the file has no readable audio.
+    static func audioLevels(url: URL, from: Double, to: Double) -> [Float]? {
+        let asset = AVURLAsset(url: url)
+        guard let track = asset.tracks(withMediaType: .audio).first, let reader = try? AVAssetReader(asset: asset) else { return nil }
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+            AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 16_000, AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 32, AVLinearPCMIsFloatKey: true, AVLinearPCMIsBigEndianKey: false, AVLinearPCMIsNonInterleaved: false
+        ])
+        reader.timeRange = CMTimeRange(start: CMTime(seconds: from, preferredTimescale: 16_000), end: CMTime(seconds: to, preferredTimescale: 16_000))
+        guard reader.canAdd(output) else { return nil }
+        reader.add(output)
+        guard reader.startReading() else { return nil }
+        var samples: [Float] = []
+        while let buffer = output.copyNextSampleBuffer(), let block = CMSampleBufferGetDataBuffer(buffer) {
+            let length = CMBlockBufferGetDataLength(block)
+            var chunk = [Float](repeating: 0, count: length / MemoryLayout<Float>.size)
+            _ = chunk.withUnsafeMutableBytes { CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: $0.baseAddress!) }
+            samples += chunk
+        }
+        guard reader.status == .completed, !samples.isEmpty else { return nil }
+        return stride(from: 0, to: samples.count, by: 160).map { first in
+            let frame = samples[first..<min(samples.count, first + 160)]
+            return (frame.reduce(0) { $0 + $1 * $1 } / Float(frame.count)).squareRoot()
+        }
+    }
+
+    /// Drops up to three throat-clearing words ("So", "Um", "And", "Okay") from a Short's first line, so it opens on its
+    /// hook. Needs real word timing; the cut lands 0.08 s before the next word and the Short keeps `minDuration`.
+    // shortcut: English filler words only; add per-language lists if non-English sources matter.
+    static func strongOpening(start: Double, duration: Double, words: [TimedSpeechWord], minDuration: Double) -> (start: Double, duration: Double) {
+        // Only words that are filler at the start of a line; "like", "now", "then" and "right" often carry meaning there.
+        let weak: Set<String> = ["so", "and", "but", "um", "uh", "erm", "okay", "ok", "well", "anyway", "alright", "yeah"]
+        let end = start + duration
+        let spoken = words.filter { $0.start >= start - 0.05 && $0.start < end }.sorted { $0.start < $1.start }
+        func bare(_ word: TimedSpeechWord) -> String { word.text.lowercased().filter { $0.isLetter } }
+        var dropped = 0
+        while dropped < min(3, spoken.count - 1), weak.contains(bare(spoken[dropped])) { dropped += 1 }
+        guard dropped > 0 else { return (start, duration) }
+        let newStart = max(start, spoken[dropped].start - 0.08)
+        guard end - newStart >= minDuration else { return (start, duration) }
+        return (newStart, end - newStart)
     }
 
     static func speechSafeRange(
@@ -237,12 +369,14 @@ enum ShortMaker {
         return (safeStart, safeEnd - safeStart)
     }
 
-    static func analyzeSubjectPath(_ url: URL, start: Double, duration: Double, zoom: Double = 1.08, configuration: GeminiConfiguration) async -> [CropKeyframe] {
-        await SubjectFramer.analyze(url, start: start, duration: duration, zoom: zoom, configuration: configuration)
+    static func analyzeSubjectPath(_ url: URL, start: Double, duration: Double, zoom: Double = 1.08, configuration: GeminiConfiguration,
+                                   speech: [TimedCaption] = []) async -> [CropKeyframe] {
+        await SubjectFramer.analyze(url, start: start, duration: duration, zoom: zoom, configuration: configuration, speech: speech)
     }
 
     /// Renders kept between edits (finished previews and Fit backgrounds), so repeats don't re-render.
-    static let renderCacheDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("RelioRenderCache")
+    /// The README generator points it at its own work folder so it never touches the app's cache.
+    nonisolated(unsafe) static var renderCacheDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("RelioRenderCache")
 
     static func renderCacheURL(_ key: String, prefix: String) -> URL {
         let digest = SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
@@ -256,7 +390,35 @@ enum ShortMaker {
         for (file, _) in dated.sorted(by: { $0.1 > $1.1 }).dropFirst(limit) { try? FileManager.default.removeItem(at: file) }
     }
 
-    static func export(source: URL, segment: EditSegment, destination: URL) async throws {
+    /// Output quality for exported Shorts. Every Short is composed at 1080×1920; the preset sets the file's size and codec.
+    enum ExportQuality: String, CaseIterable, Identifiable, Sendable {
+        case full, compact, small
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .full: "1080p · H.264"
+            case .compact: "1080p · HEVC"
+            case .small: "720p · H.264"
+            }
+        }
+        var detail: String {
+            switch self {
+            case .full: "Best quality. Plays everywhere."
+            case .compact: "Same quality, smaller files. Plays on recent phones and apps."
+            case .small: "Smallest files, fastest to send."
+            }
+        }
+        var resolution: String { self == .small ? "720 × 1280" : "1080 × 1920" }
+        var preset: String {
+            switch self {
+            case .full: AVAssetExportPreset1920x1080
+            case .compact: AVAssetExportPresetHEVC1920x1080
+            case .small: AVAssetExportPreset1280x720
+            }
+        }
+    }
+
+    static func export(source: URL, segment: EditSegment, destination: URL, quality: ExportQuality = .full) async throws {
         guard !FileManager.default.fileExists(atPath: destination.path) else { throw Failure.destinationExists }
         let (composition, videoComposition) = try await makeComposition(source: source, segment: segment, live: false)
         if let captions = captionLayer(for: segment) {
@@ -269,7 +431,7 @@ enum ShortMaker {
         try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
         let temporary = destination.deletingLastPathComponent().appendingPathComponent(".relio-\(UUID()).mp4")
         defer { try? FileManager.default.removeItem(at: temporary) }
-        guard let session = AVAssetExportSession(asset: composition, presetName: AVAssetExportPreset1920x1080) else { throw Failure.cannotExport }
+        guard let session = AVAssetExportSession(asset: composition, presetName: quality.preset) else { throw Failure.cannotExport }
         session.videoComposition = videoComposition
         session.outputURL = temporary
         session.outputFileType = .mp4
@@ -322,13 +484,16 @@ enum ShortMaker {
         let drawsFrames = isSplit || usesBlurredFitBackground
         let draw: @Sendable (CIImage) -> CIImage
         let centers = segment.splitCenters ?? []
-        if isSplit { draw = { image in ShortMaker.splitScreenFrame(image, transform: preferred, centers: centers) } }
-        else { draw = { image in ShortMaker.blurredFitFrame(image, transform: preferred) } }
+        // preferredTransform is in y-down video space; Core Image is y-up, so mirror it or rotated
+        // phone video comes out upside down. The drawing code re-normalizes the translation.
+        let upright = CGAffineTransform(a: preferred.a, b: -preferred.b, c: -preferred.c, d: preferred.d, tx: preferred.tx, ty: -preferred.ty)
+        if isSplit { draw = { image in ShortMaker.splitScreenFrame(image, transform: upright, centers: centers) } }
+        else { draw = { image in ShortMaker.blurredFitFrame(image, transform: upright) } }
         if drawsFrames && !live {
             // The drawn picture depends only on the layout and source range, so caption and style edits reuse it.
             let cached = isSplit
-                ? renderCacheURL("split-v2|\(source.path)|\(segment.start)|\(segment.duration)|\(centers)", prefix: "split")
-                : renderCacheURL("fit-v2|\(source.path)|\(segment.start)|\(segment.duration)", prefix: "fit")
+                ? renderCacheURL("split-v3|\(source.path)|\(segment.start)|\(segment.duration)|\(centers)", prefix: "split")
+                : renderCacheURL("fit-v3|\(source.path)|\(segment.start)|\(segment.duration)", prefix: "fit")
             if !FileManager.default.fileExists(atPath: cached.path) {
                 try FileManager.default.createDirectory(at: renderCacheDirectory, withIntermediateDirectories: true)
                 let intermediate = renderCacheDirectory.appendingPathComponent(".relio-fit-\(UUID()).mp4")
@@ -368,7 +533,9 @@ enum ShortMaker {
                     var completePath = path
                     if let first = path.first, first.time > 0 { completePath.insert(.init(time: 0, position: first.position, preserveWholeFrame: first.preserveWholeFrame), at: 0) }
                     if let last = path.last, last.time < segment.duration { completePath.append(.init(time: segment.duration, position: last.position, preserveWholeFrame: last.preserveWholeFrame)) }
-                    for pair in zip(completePath, completePath.dropFirst()) where pair.1.time > pair.0.time {
+                    // Eased at render time, so saved paths, older Shorts and hand-set focus points all move smoothly.
+                    let smoothPath = SubjectFramer.eased(completePath)
+                    for pair in zip(smoothPath, smoothPath.dropFirst()) where pair.1.time > pair.0.time {
                         let fromOffset = panDistance * (0.5 - pair.0.position)
                         let toOffset = panDistance * (0.5 - pair.1.position)
                         let fitScale = min(target.width / oriented.width, target.height / oriented.height)

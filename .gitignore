@@ -2,3 +2,5 @@
 dist/
 test-output/
 .DS_Store
+bin/
+obj/
