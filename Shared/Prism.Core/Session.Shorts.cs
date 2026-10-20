@@ -1,0 +1,535 @@
+namespace Prism.Core;
+
+public sealed partial class AppSession
+{
+    CancellationTokenSource? generationCancellation;
+
+    /// <summary>Await a state change on the toolkit's UI thread.</summary>
+    Task UI(Action action)
+    {
+        if (context is null || SynchronizationContext.Current == context)
+        {
+            action();
+            return Task.CompletedTask;
+        }
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Post(() =>
+        {
+            try { action(); completion.SetResult(); }
+            catch (Exception error) { completion.SetException(error); }
+        });
+        return completion.Task;
+    }
+
+    Task<T> UI<T>(Func<T> action)
+    {
+        if (context is null || SynchronizationContext.Current == context) return Task.FromResult(action());
+        var completion = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Post(() =>
+        {
+            try { completion.SetResult(action()); }
+            catch (Exception error) { completion.SetException(error); }
+        });
+        return completion.Task;
+    }
+
+    void ScopeGeminiCallbacks(GeminiConfiguration configuration, Func<bool> current)
+    {
+        configuration.OnRetry = note => Post(() =>
+        {
+            if (!current()) return;
+            Message = note;
+            if (GenerationProgress is not null && GenerationStage != "Cancelling…") GenerationStage = note;
+        });
+        configuration.OnFallback = (from, to) => Post(() =>
+        {
+            if (current()) ModelFallbackNote = $"{from} was overloaded, so Prism switched to {to}.";
+        });
+    }
+
+    public void SelectPreview(Guid? shortId) => _ = SelectPreviewAsync(shortId);
+
+    /// <summary>Switches the player, cancelling older renders and ignoring their results.</summary>
+    public async Task SelectPreviewAsync(Guid? shortId)
+    {
+        previewCancellation?.Cancel();
+        if (subjectTrackingRevision is not null)
+        {
+            subjectTrackingRevision = null;
+            IsBusy = false;
+        }
+        var cancellation = new CancellationTokenSource();
+        previewCancellation = cancellation;
+        var token = cancellation.Token;
+        var revision = ++previewRevision;
+        var projectId = project?.Id;
+        PreviewShortId = shortId;
+        PreviewError = null;
+        PreviewPath = null;
+        PreviewSegment = null;
+        IsPreviewLoading = false;
+        Changed(nameof(ActiveSegment));
+        Changed(nameof(PreviewLength));
+        var segment = project?.Segments.FirstOrDefault(s => s.Id == shortId);
+        var video = project?.Media.FirstOrDefault(m => m.Kind == "video" && m.Id == segment?.MediaId)
+            ?? project?.Media.FirstOrDefault(m => m.Kind == "video" && m.Id == selection);
+        if (video is null)
+        {
+            cancellation.Dispose();
+            if (ReferenceEquals(previewCancellation, cancellation)) previewCancellation = null;
+            return;
+        }
+        if (segment is null)
+        {
+            PreviewShortId = null;
+            PreviewPath = video.Path;
+            cancellation.Dispose();
+            if (ReferenceEquals(previewCancellation, cancellation)) previewCancellation = null;
+            return;
+        }
+        Selection = video.Id;
+        segment = PrismJson.Clone(segment);
+        IsPreviewLoading = true;
+        var configuration = !IsBusy && segment.CropTrackingVersion != SubjectFramer.Version && segment.SplitScreen != true
+            ? GeminiConfiguration() : null;
+        if (configuration is not null)
+        {
+            IsBusy = true;
+            subjectTrackingRevision = revision;
+            ModelFallbackNote = null;
+            Message = "Gemini is framing the main subject…";
+        }
+        bool Current() => !token.IsCancellationRequested && revision == previewRevision && project?.Id == projectId;
+        if (configuration is not null) ScopeGeminiCallbacks(configuration, Current);
+        try
+        {
+            if (configuration is not null)
+            {
+                var path = await Task.Run(() => SubjectFramer.Analyze(video.Path, segment.Start, segment.Duration,
+                    segment.CropZoom ?? 1.08, configuration, segment.Captions, cancellation: token), token).ConfigureAwait(false);
+                token.ThrowIfCancellationRequested();
+                var updated = await UI(() =>
+                {
+                    if (!Current() || subjectTrackingRevision != revision || project is null) return null;
+                    var index = project.Segments.FindIndex(s => s.Id == shortId);
+                    if (index < 0) return null;
+                    var previous = project.Segments[index];
+                    var tracked = PrismJson.Clone(previous);
+                    tracked.CropKeyframes = path;
+                    tracked.CropTrackingVersion = SubjectFramer.Version;
+                    project.Segments[index] = tracked;
+                    try { Save(); }
+                    catch { project.Segments[index] = previous; throw; }
+                    subjectTrackingRevision = null;
+                    IsBusy = false;
+                    ProjectChanged();
+                    Changed(nameof(ActiveSegment));
+                    Message = WithModelNote(path.Count == 0
+                        ? "Gemini could not frame this Short, so the crop stays centered. Use Re-track to try again."
+                        : "Subject tracking ready.");
+                    return PrismJson.Clone(tracked);
+                }).ConfigureAwait(false);
+                if (updated is null) return;
+                segment = updated;
+            }
+            var rendered = await Task.Run(() => Renderer.Preview(video.Path, segment, token), token).ConfigureAwait(false);
+            await UI(() =>
+            {
+                if (!Current()) return;
+                PreviewSegment = segment;
+                PreviewPath = rendered;
+                IsPreviewLoading = false;
+            }).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+        catch (Exception error)
+        {
+            await UI(() =>
+            {
+                if (!Current()) return;
+                IsPreviewLoading = false;
+                PreviewError = error.Message;
+                Message = subjectTrackingRevision == revision
+                    ? $"Could not save subject tracking: {error.Message}" : $"Could not preview Short: {error.Message}";
+            }).ConfigureAwait(false);
+        }
+        finally
+        {
+            await UI(() =>
+            {
+                if (subjectTrackingRevision == revision)
+                {
+                    subjectTrackingRevision = null;
+                    IsBusy = false;
+                }
+                if (revision == previewRevision) IsPreviewLoading = false;
+                if (ReferenceEquals(previewCancellation, cancellation)) previewCancellation = null;
+            }).ConfigureAwait(false);
+            cancellation.Dispose();
+        }
+    }
+
+    public Task MakeShort(double? requestedDuration = null)
+    {
+        var video = project?.Media.FirstOrDefault(m => m.Id == selection && m.Kind == "video")
+            ?? project?.Media.FirstOrDefault(m => m.Kind == "video");
+        return video is null ? Task.CompletedTask : MakeShorts(video, 1, requestedDuration ?? shortDuration, SourceRegion.EntireVideo);
+    }
+
+    public Task ContinueImport()
+    {
+        if (IsBusy || selection is null) return Task.CompletedTask;
+        Screen = Screen.Editor;
+        return MakeConfiguredShorts();
+    }
+
+    public Task MakeConfiguredShorts()
+    {
+        var video = project?.Media.FirstOrDefault(m => m.Id == selection && m.Kind == "video")
+            ?? project?.Media.FirstOrDefault(m => m.Kind == "video");
+        return video is null ? Task.CompletedTask : MakeShorts(video, shortCount, shortDuration, shortSourceRegion);
+    }
+
+    public async Task MakeShorts(MediaItem video, int count, double duration, SourceRegion sourceRegion)
+    {
+        if (IsBusy || project is null) return;
+        if (sourceRegion == SourceRegion.Custom && CustomRangeError is { } rangeError) { Message = rangeError; return; }
+        var customStart = sourceRegion == SourceRegion.Custom ? MinuteSeconds(customStartMinutes) : null;
+        var customEnd = sourceRegion == SourceRegion.Custom ? MinuteSeconds(customEndMinutes) : null;
+        if (GeminiConfiguration() is not { } configuration)
+        {
+            Message = "Add and save your Gemini key in Settings first.";
+            GenerationError = new GenerationFailure("No Gemini API key is saved. Add your Google AI Studio key in Settings.", GenerationFailureKind.Settings);
+            return;
+        }
+        ModelFallbackNote = null;
+        IsBusy = true;
+        GenerationProgress = 0;
+        GenerationError = null;
+        GenerationStage = "Preparing video";
+        Message = "Preparing video analysis…";
+        var cancellation = new CancellationTokenSource();
+        generationCancellation = cancellation;
+        var token = cancellation.Token;
+        var projectId = project.Id;
+        var usedRanges = project.Segments.Where(s => s.MediaId == video.Id).Select(s => new SourceInterval(s.Start, s.Start + s.Duration)).ToList();
+        var savedTranscript = project.Transcripts?.GetValueOrDefault(PrismJson.Key(video.Id));
+        if (savedTranscript is null && TranscriptFromOtherProjects(video) is { } earlier)
+        {
+            savedTranscript = earlier;
+            StoreTranscript(earlier, video.Id);
+        }
+        var videoType = shortVideoType;
+        var captionStyle = shortCaptionStyle;
+        bool Current() => ReferenceEquals(generationCancellation, cancellation) && project?.Id == projectId;
+        ScopeGeminiCallbacks(configuration, () => Current() && !token.IsCancellationRequested);
+        try
+        {
+            var results = await Task.Run(() => ShortMaker.Analyze(video.Path, duration, count, sourceRegion, configuration,
+                customStart, customEnd, usedRanges, videoType, savedTranscript,
+                onTranscript: transcript => Post(() =>
+                {
+                    if (Current()) StoreTranscript(transcript, video.Id);
+                }),
+                progress: (fraction, stage) => Post(() =>
+                {
+                    if (!Current() || token.IsCancellationRequested || GenerationProgress is null || GenerationStage == "Cancelling…") return;
+                    GenerationProgress = Math.Max(GenerationProgress ?? 0, fraction);
+                    GenerationStage = stage;
+                }), cancellation: token), token).ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
+            var candidates = results.Select(result => new EditSegment
+            {
+                MediaId = video.Id, Start = result.Start, Duration = result.Duration, Caption = result.Caption,
+                FitToFrame = result.FitToFrame, Captions = result.Captions, CropKeyframes = result.CropKeyframes,
+                CropTrackingVersion = SubjectFramer.Version, SpeechWords = result.SpeechWords,
+                SuggestedTitle = result.SuggestedTitle, SelectionReason = result.SelectionReason,
+                CaptionNotice = result.AnalysisWarning, CaptionStyle = captionStyle,
+                SplitScreen = videoType == VideoType.Podcast ? true : null,
+                CaptionPosition = videoType == VideoType.Podcast ? Prism.Core.CaptionPosition.Middle : null,
+            }).ToList();
+            for (var index = 0; index < candidates.Count; index++)
+            {
+                if (candidates[index].SplitScreen != true) continue;
+                token.ThrowIfCancellationRequested();
+                var number = index + 1;
+                await UI(() =>
+                {
+                    if (Current() && !token.IsCancellationRequested) GenerationStage = $"Gemini · finding both speakers · Short {number} of {candidates.Count}";
+                }).ConfigureAwait(false);
+                var candidate = candidates[index];
+                candidate.SplitCenters = await ShortMaker.FindSplitCenters(video.Path, candidate.Start, candidate.Duration, configuration, token).ConfigureAwait(false);
+            }
+            token.ThrowIfCancellationRequested();
+            await UI(() =>
+            {
+                if (!Current()) return;
+                token.ThrowIfCancellationRequested();
+                var fresh = AppendGeneratedShorts(candidates);
+                if (fresh.Count == 0)
+                {
+                    Message = WithModelNote("No new distinct moments were found in this range. Your existing clips were kept. Try another region or length.");
+                    GenerationError = new GenerationFailure(Message, GenerationFailureKind.NoMoments);
+                    return;
+                }
+                var resultMessage = $"Gemini selected {fresh.Count} complete clip ranges and layouts. Review framing and captions before export.";
+                if (results.FirstOrDefault(r => r.AnalysisWarning is not null)?.AnalysisWarning is { } warning) resultMessage += " " + warning;
+                Message = WithModelNote(resultMessage);
+                Say(false, Message);
+                SelectPreview(fresh[0].Id);
+            }).ConfigureAwait(false);
+        }
+        catch (Exception error)
+        {
+            await UI(() =>
+            {
+                if (!Current()) return;
+                Message = token.IsCancellationRequested ? "Generation cancelled. Your existing clips were kept." : $"Analysis failed: {error.Message}";
+                if (!token.IsCancellationRequested) GenerationError = new GenerationFailure(error.Message, FailureKind(error));
+                ModelFallbackNote = null;
+            }).ConfigureAwait(false);
+        }
+        finally
+        {
+            await UI(() =>
+            {
+                if (!ReferenceEquals(generationCancellation, cancellation)) return;
+                GenerationProgress = null;
+                generationCancellation = null;
+                IsBusy = false;
+            }).ConfigureAwait(false);
+            cancellation.Dispose();
+        }
+    }
+
+    public void CancelGeneration()
+    {
+        if (generationCancellation is null) return;
+        GenerationStage = "Cancelling…";
+        generationCancellation.Cancel();
+    }
+
+    /// <summary>Commits only new, distinct ranges; saving failure restores the entire previous batch.</summary>
+    public List<EditSegment> AppendGeneratedShorts(IEnumerable<EditSegment> candidates)
+    {
+        if (project is null) return [];
+        var previous = project.Segments;
+        var fresh = new List<EditSegment>();
+        foreach (var candidate in candidates)
+        {
+            if (!double.IsFinite(candidate.Start) || !double.IsFinite(candidate.Duration) || candidate.Start < 0 || candidate.Duration <= 0)
+                throw new ShortMakerException(ShortMakerFailure.InvalidRange);
+            var video = project.Media.FirstOrDefault(m => m.Id == candidate.MediaId && m.Kind == "video")
+                ?? throw new ShortMakerException(ShortMakerFailure.NoVideo);
+            if (candidate.Start + candidate.Duration > video.Duration + 0.05)
+                throw new ShortMakerException(ShortMakerFailure.InvalidRange);
+            if (previous.Concat(fresh).Any(existing => existing.Id == candidate.Id || existing.MediaId == candidate.MediaId
+                && TranscriptSelection.Overlaps(candidate.Start, candidate.Duration, existing.Start, existing.Duration))) continue;
+            fresh.Add(PrismJson.Clone(candidate));
+        }
+        if (fresh.Count == 0) return [];
+        var snapshot = PrismJson.Clone(previous);
+        project.Segments = [.. previous, .. fresh];
+        try { Save(); }
+        catch { project.Segments = previous; throw; }
+        editHistory.Add(snapshot);
+        Changed(nameof(CanUndo));
+        ProjectChanged();
+        return fresh;
+    }
+
+    public void ChooseExport(Guid? only = null)
+    {
+        if (IsBusy || project is null || project.Media.Count == 0) return;
+        ExportChoice = new ExportChoice(project.Segments.Where(s => only is null || s.Id == only).Select(s => s.Id).ToHashSet(),
+            false, Settings.ExportQuality, DefaultExportFolder());
+    }
+
+    public string DefaultExportFolder() => Path.Combine(platform.DownloadsFolder, "Prism", ExportFileName(project?.DisplayTitle) ?? "Prism export");
+
+    public Task ExportAll()
+    {
+        ChooseExport();
+        return ExportChoice is { } choice ? Export(choice) : Task.CompletedTask;
+    }
+
+    /// <summary>Renders the checked Shorts in project order, then copies the untouched main videos.</summary>
+    public async Task Export(ExportChoice choice)
+    {
+        if (IsBusy || project is null) return;
+        var segments = project.Segments.Select((segment, index) => (Segment: PrismJson.Clone(segment), Number: index + 1))
+            .Where(pair => choice.ShortIds.Contains(pair.Segment.Id)).ToList();
+        var media = PrismJson.Clone(project.Media);
+        var sources = choice.IncludeSource ? media.Where(m => m.Kind == "video").ToList() : [];
+        if (segments.Count == 0 && sources.Count == 0) return;
+        try { Directory.CreateDirectory(choice.Folder); }
+        catch (Exception error)
+        {
+            ExportChoice = choice with { Error = $"Could not use this folder: {error.Message} Choose another folder." };
+            return;
+        }
+        try { Settings.ExportQuality = choice.Quality; Settings.Save(); }
+        catch (Exception error)
+        {
+            ExportChoice = choice with { Error = $"Could not save export settings: {error.Message}" };
+            return;
+        }
+        ExportChoice = null;
+        ExportSummary = null;
+        ModelFallbackNote = null;
+        var projectId = project.Id;
+        var projectName = project.DisplayTitle;
+        var folder = choice.Folder;
+        var total = segments.Count + sources.Count;
+        ExportedFiles = [];
+        Changed(nameof(ExportedFiles));
+        LastExportFolder = folder;
+        LastExportQuality = choice.Quality;
+        LastExportShortCount = segments.Count;
+        Changed(nameof(LastExportQuality));
+        Changed(nameof(LastExportShortCount));
+        IsBusy = true;
+        IsExporting = true;
+        GenerationProgress = 0;
+        GenerationStage = "Preparing export";
+        GenerationError = null;
+        Message = total == 1 ? "Exporting 1 file…" : $"Exporting {total} files…";
+        var cancellation = new CancellationTokenSource();
+        generationCancellation = cancellation;
+        var token = cancellation.Token;
+        var configuration = GeminiConfiguration();
+        bool Current() => ReferenceEquals(generationCancellation, cancellation) && project?.Id == projectId;
+        if (configuration is not null) ScopeGeminiCallbacks(configuration, () => Current() && !token.IsCancellationRequested);
+        try
+        {
+            for (var step = 0; step < segments.Count; step++)
+            {
+                token.ThrowIfCancellationRequested();
+                var (segment, number) = segments[step];
+                var currentStep = step;
+                await UI(() =>
+                {
+                    if (!Current() || token.IsCancellationRequested) return;
+                    GenerationProgress = (double)currentStep / total;
+                    GenerationStage = $"Exporting Short {number} · {currentStep + 1} of {total}";
+                }).ConfigureAwait(false);
+                var video = media.FirstOrDefault(m => m.Id == segment.MediaId) ?? throw new ShortMakerException(ShortMakerFailure.NoVideo);
+                if (segment.CropTrackingVersion != SubjectFramer.Version && segment.SplitScreen != true && configuration is not null)
+                {
+                    await UI(() => { if (Current() && !token.IsCancellationRequested) Message = $"Gemini is framing Short {number}…"; }).ConfigureAwait(false);
+                    segment.CropKeyframes = await SubjectFramer.Analyze(video.Path, segment.Start, segment.Duration,
+                        segment.CropZoom ?? 1.08, configuration, segment.Captions, cancellation: token).ConfigureAwait(false);
+                    token.ThrowIfCancellationRequested();
+                    segment.CropTrackingVersion = SubjectFramer.Version;
+                    await UI(() =>
+                    {
+                        if (!Current() || project is null || token.IsCancellationRequested) return;
+                        var index = project.Segments.FindIndex(s => s.Id == segment.Id);
+                        if (index < 0) return;
+                        var previous = project.Segments[index];
+                        var tracked = PrismJson.Clone(previous);
+                        tracked.CropKeyframes = segment.CropKeyframes;
+                        tracked.CropTrackingVersion = SubjectFramer.Version;
+                        project.Segments[index] = tracked;
+                        try { Save(); }
+                        catch { project.Segments[index] = previous; throw; }
+                        ProjectChanged();
+                        Changed(nameof(ActiveSegment));
+                    }).ConfigureAwait(false);
+                }
+                await UI(() => { if (Current() && !token.IsCancellationRequested) Message = $"Rendering Short {number}…"; }).ConfigureAwait(false);
+                token.ThrowIfCancellationRequested();
+                var name = ExportFileName(segment.SuggestedTitle) ?? $"{ExportFileName(projectName) ?? "Prism"} Short {number}";
+                var destination = UniqueDestination(name + ".mp4", folder);
+                await Task.Run(() => Renderer.Export(video.Path, segment, destination, choice.Quality,
+                    fraction => Post(() =>
+                    {
+                        if (Current() && !token.IsCancellationRequested && GenerationProgress is not null)
+                            GenerationProgress = Math.Max(GenerationProgress ?? 0, (currentStep + fraction) / total);
+                    }), token), token).ConfigureAwait(false);
+                await UI(() =>
+                {
+                    if (!Current()) return;
+                    ExportedFiles.Add(destination);
+                    Changed(nameof(ExportedFiles));
+                }).ConfigureAwait(false);
+            }
+            foreach (var video in sources)
+            {
+                token.ThrowIfCancellationRequested();
+                await UI(() =>
+                {
+                    if (!Current() || token.IsCancellationRequested) return;
+                    GenerationProgress = (double)ExportedFiles.Count / total;
+                    GenerationStage = "Copying the main video";
+                }).ConfigureAwait(false);
+                var destination = UniqueDestination(video.Path, folder);
+                var created = false;
+                try
+                {
+                    await using var input = new FileStream(video.Path, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, true);
+                    await using var output = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true);
+                    created = true;
+                    await input.CopyToAsync(output, token).ConfigureAwait(false);
+                }
+                catch
+                {
+                    if (created) try { File.Delete(destination); } catch { }
+                    throw;
+                }
+                await UI(() =>
+                {
+                    if (!Current()) return;
+                    ExportedFiles.Add(destination);
+                    Changed(nameof(ExportedFiles));
+                }).ConfigureAwait(false);
+            }
+            token.ThrowIfCancellationRequested();
+            await UI(() =>
+            {
+                if (!Current()) return;
+                token.ThrowIfCancellationRequested();
+                var parts = new List<string>();
+                if (segments.Count > 0) parts.Add(segments.Count == 1 ? "1 Short" : $"{segments.Count} Shorts");
+                if (sources.Count > 0) parts.Add("the main video");
+                Message = WithModelNote($"Exported {string.Join(" and ", parts)} to {DisplayPath(folder)}.");
+                ExportSummary = Message;
+            }).ConfigureAwait(false);
+        }
+        catch (Exception error)
+        {
+            await UI(() =>
+            {
+                if (!Current()) return;
+                var completed = ExportedFiles.Count;
+                Message = token.IsCancellationRequested
+                    ? $"Export cancelled. {completed} of {total} files finished in {DisplayPath(folder)}."
+                    : completed == 0 ? $"Export failed: {error.Message}"
+                    : $"Export stopped after {completed} of {total} files. Completed files are in {DisplayPath(folder)}. {error.Message}";
+                if (token.IsCancellationRequested) ExportSummary = Message;
+                else GenerationError = new GenerationFailure(Message, FailureKind(error), IsExport: true);
+                ModelFallbackNote = null;
+            }).ConfigureAwait(false);
+        }
+        finally
+        {
+            await UI(() =>
+            {
+                if (!ReferenceEquals(generationCancellation, cancellation)) return;
+                generationCancellation = null;
+                IsBusy = false;
+                IsExporting = false;
+                GenerationProgress = null;
+            }).ConfigureAwait(false);
+            cancellation.Dispose();
+        }
+    }
+
+    public void RevealExports()
+    {
+        if (ExportedFiles.Count > 0) { platform.Reveal(ExportedFiles); return; }
+        var folder = new[] { LastExportFolder, project is null ? null : DefaultExportFolder() }
+            .OfType<string>().FirstOrDefault(Directory.Exists) ?? (projectPath is null ? null : Path.Combine(projectPath, "Exports"));
+        if (folder is not null) platform.OpenFolder(folder);
+    }
+}

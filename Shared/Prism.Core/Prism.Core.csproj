@@ -10,6 +10,7 @@
   <ItemGroup>
     <!-- Prism's brand fonts and their licenses, shared with the macOS app; they ship next to each app. -->
     <Content Include="..\..\macOS\packaging\Fonts\*.*" Link="Fonts\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\macOS\assets\readme\icon.png" Link="Brand\Prism.png" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
