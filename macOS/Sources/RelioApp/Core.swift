@@ -336,15 +336,29 @@ struct MachineProfile {
 final class ProjectStore {
     let root: URL
     private var db: OpaquePointer?
-    init(root: URL) throws {
+    /// `create: false` opens only an existing project, so reading a moved, deleted or wrong folder never leaves a database behind.
+    init(root: URL, create: Bool = true) throws {
         self.root = root
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        guard sqlite3_open(root.appendingPathComponent("project.sqlite").path, &db) == SQLITE_OK else { throw StoreError.database }
+        let file = root.appendingPathComponent("project.sqlite").path
+        if create {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        } else if !FileManager.default.fileExists(atPath: file) {
+            throw StoreError.notAProject
+        }
+        guard sqlite3_open(file, &db) == SQLITE_OK else { throw StoreError.database }
         try execute("PRAGMA journal_mode=WAL")
         try execute("CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value BLOB NOT NULL)")
     }
     deinit { sqlite3_close(db) }
-    enum StoreError: Error { case database }
+    enum StoreError: LocalizedError {
+        case database, notAProject
+        var errorDescription: String? {
+            switch self {
+            case .database: "The project database could not be read or saved."
+            case .notAProject: "This folder is not a Prism project."
+            }
+        }
+    }
     private func execute(_ sql: String) throws {
         guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else { throw StoreError.database }
     }

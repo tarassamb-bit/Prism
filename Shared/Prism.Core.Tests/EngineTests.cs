@@ -1,0 +1,435 @@
+using System.Text.Json;
+using Prism.Core;
+
+namespace Prism.Core.Tests;
+
+public class SelectionTests
+{
+    static TimedCaption Cue(string text, double start, double duration) => new(text, start, duration);
+
+    [Fact]
+    public void WindowsCoverEverySegmentIncludingTheTail()
+    {
+        var cues = Enumerable.Range(0, 120).Select(i => Cue($"Complete story {i}.", i * 10, 8)).ToList();
+        var windows = TranscriptSelection.Windows(cues, (0, 1200));
+        Assert.Equal(0, windows[0].Start);
+        Assert.Equal(1198, windows[^1].End);
+        Assert.All(windows.Zip(windows.Skip(1)), pair => Assert.True(pair.Second.Start < pair.First.End, "Windows must overlap"));
+    }
+
+    [Fact]
+    public void BatchesAreBalanced()
+    {
+        var batches = TranscriptSelection.Batches(Enumerable.Range(0, 13).ToList(), 6);
+        Assert.Equal([5, 4, 4], batches.Select(b => b.Count));
+    }
+
+    [Fact]
+    public void CutsFinishTheirSentenceAndStartOnOne()
+    {
+        var cues = new[] { Cue("One.", 0, 5), Cue("Two.", 5, 5), Cue("Three.", 10, 5), Cue("Four.", 15, 5) };
+        var range = TranscriptSelection.CompleteSentences(6, 7, cues, (0, 20), 5, 15);
+        Assert.Equal(5, range.Start);
+        Assert.Equal(10, range.Duration);
+    }
+
+    [Fact]
+    public void FillerEdgesAreTrimmed()
+    {
+        var cues = new[] { Cue("Okay so.", 0, 2), Cue("Nobody expected the crash.", 2, 6), Cue("It changed everything.", 8, 6), Cue("Thanks for watching.", 14, 2) };
+        var range = TranscriptSelection.TrimmedFiller(0, 16, cues, 8);
+        Assert.Equal(2, range.Start);
+        Assert.Equal(12, range.Duration);
+    }
+
+    [Fact]
+    public void AlignmentNeedsTheOpeningPayoffAndMostWords()
+    {
+        var reference = new[] { Cue("Here is a complete story with a useful ending.", 0, 5) };
+        var good = "Here is a complete story with a useful ending.".Split(' ').Select((w, i) => new TimedSpeechWord(w, i * 0.5, 0.4)).ToList();
+        Assert.True(TranscriptSelection.AlignmentIsReliable(good, reference));
+        Assert.False(TranscriptSelection.AlignmentIsReliable(good.Take(5).ToList(), reference));
+    }
+
+    [Fact]
+    public void ValidationKeepsStrongDistinctClipsInRange()
+    {
+        var valid = GeminiSelection.Validate([
+            new Clip(300, 330, 8, "track"), new Clip(305, 335, 9, "fit"), new Clip(550, 580, 7, "fit"),
+            new Clip(590, 620, 10, "track"), new Clip(double.NaN, 30, 10, "fit"),
+        ], (300, 600), 30, 3);
+        Assert.Equal([305.0, 550.0], valid.Select(c => c.Start));
+        Assert.Throws<GeminiException>(() => GeminiSelection.Validate([new Clip(5, 35, 6.9, "fit")], (0, 60), 30, 1));
+        var fallback = GeminiSelection.StrongestOrBest([new Clip(5, 35, 6, "fit", Reason: "Good hook.")], (0, 100), 30, 1, []);
+        Assert.StartsWith("Weaker pick", fallback[0].Reason);
+    }
+
+    [Fact]
+    public void CriteriaCombineIntoOneScore()
+    {
+        var rated = JsonDocument.Parse("""
+            [{"id":0,"hook":9,"payoff":8,"standalone":9,"emotion":5,"novelty":6},
+             {"id":1,"hook":10,"payoff":9,"standalone":3,"emotion":9,"novelty":9},
+             {"id":2,"score":55}]
+            """).RootElement.EnumerateArray().Select(GeminiSelection.ParseWindowScore).ToList();
+        Assert.Equal(80.5, rated[0].Score, 2);
+        Assert.True(rated[1].Score < 70, "A window that doesn't stand alone must fall below the clip line");
+        Assert.Equal(55, rated[2].Score);
+        Assert.Throws<GeminiException>(() => GeminiSelection.ParseWindowScore(JsonDocument.Parse("""{"id":0,"hook":11,"payoff":8,"standalone":9,"emotion":5,"novelty":6}""").RootElement));
+        Assert.Equal([2, 0, 1], GeminiSelection.RankedWindowIds([new(0, 20), new(1, 10), new(2, 95)], [0, 1, 2]));
+        Assert.Throws<GeminiException>(() => GeminiSelection.RankedWindowIds([new(0, 50), new(0, 90)], [0, 1]));
+    }
+
+    [Fact]
+    public void WordTimingsAreValidatedAndGroupedIntoCaptions()
+    {
+        var words = GeminiSelection.ValidatedWords([("Hello", 0.1, 0.5), ("world.", 0.6, 1)], 300, 60);
+        var cues = GeminiSelection.CaptionCues(words);
+        Assert.Single(cues);
+        Assert.Equal("Hello world.", cues[0].Text);
+        Assert.Equal(300.1, cues[0].Start, 3);
+        Assert.Throws<GeminiException>(() => GeminiSelection.ValidatedWords([("bad", 2, 1)], 0, 60));
+        var overlapping = GeminiSelection.ValidatedWords([("First", 0.1, 0.6), ("word.", 0.5, 1)], 120, 60);
+        Assert.Equal(overlapping[0].Start + overlapping[0].Duration, overlapping[1].Start, 3);
+    }
+
+    [Fact]
+    public void OpeningFillerIsDroppedButMeaningfulWordsStay()
+    {
+        static List<TimedSpeechWord> Words(params string[] texts) => texts.Select((t, i) => new TimedSpeechWord(t, 10 + i * 0.4, 0.3)).ToList();
+        var opened = ShortMaker.StrongOpening(9.9, 20, Words("So,", "um,", "nobody", "expected", "this."), 5);
+        Assert.Equal(10.72, opened.Start, 3);
+        Assert.Equal(29.9, opened.Start + opened.Duration, 3);
+        Assert.Equal(9.9, ShortMaker.StrongOpening(9.9, 20, Words("Like", "most", "people,", "I", "panicked."), 5).Start);
+        Assert.Equal(9.9, ShortMaker.StrongOpening(9.9, 1, Words("So", "go."), 1).Start);
+    }
+
+    [Fact]
+    public void SpeakerCentersNeedTwoClearGroups()
+    {
+        Assert.Equal([0.3, 0.71], ShortMaker.SplitCenters([0.31, 0.7, 0.29, 0.72, 0.3])!.Select(x => Math.Round(x, 2)));
+        Assert.Null(ShortMaker.SplitCenters([0.48, 0.5, 0.52]));
+        Assert.Null(ShortMaker.SplitCenters([0.4]));
+    }
+}
+
+public class GeminiTests
+{
+    [Fact]
+    public async Task BusyServersAreRetriedThenOtherModelsTried()
+    {
+        var gemini = new FakeGemini();
+        var notes = new List<string>();
+        var configuration = gemini.Configuration();
+        configuration.OnRetry = notes.Add;
+        foreach (var status in new[] { 503, 503, 503, 500, 200 }) gemini.Statuses.Enqueue(status);
+        var recovered = await Gemini.Generate<JsonElement>([Gemini.Text("check")], new System.Text.Json.Nodes.JsonObject(), configuration);
+        Assert.True(recovered.GetProperty("ok").GetBoolean());
+        Assert.Equal(4, notes.Count);
+        Assert.All(notes, n => Assert.StartsWith("Gemini is busy", n));
+
+        var switches = new List<string>();
+        configuration.OnFallback = (from, to) => switches.Add($"{from}>{to}");
+        gemini.Models.Clear();
+        for (var i = 0; i < Gemini.RetryWaits.Length + 1; i++) gemini.Statuses.Enqueue(503);
+        gemini.Statuses.Enqueue(200);
+        await Gemini.Generate<JsonElement>([Gemini.Text("check")], new System.Text.Json.Nodes.JsonObject(), configuration);
+        Assert.Equal(["gemini-3.1-flash-lite>gemini-3.5-flash-lite"], switches);
+        Assert.Equal("gemini-3.5-flash-lite", gemini.Models[^1]);
+        gemini.Models.Clear();
+        await Gemini.Generate<JsonElement>([Gemini.Text("check")], new System.Text.Json.Nodes.JsonObject(), configuration);
+        Assert.Equal(["gemini-3.5-flash-lite"], gemini.Models);
+        Gemini.RememberWorking("gemini-3.1-flash-lite", "gemini-3.1-flash-lite");
+    }
+
+    [Fact]
+    public async Task QuotaAndTruncationFailClearly()
+    {
+        var gemini = new FakeGemini { DefaultStatus = 429 };
+        var quota = await Assert.ThrowsAsync<GeminiException>(() => Gemini.Generate<JsonElement>([Gemini.Text("x")], new System.Text.Json.Nodes.JsonObject(), gemini.Configuration()));
+        Assert.Equal(429, quota.Status);
+        var truncated = new FakeGemini { Finish = "MAX_TOKENS" };
+        var invalid = await Assert.ThrowsAsync<GeminiException>(() => Gemini.Generate<JsonElement>([Gemini.Text("x")], new System.Text.Json.Nodes.JsonObject(), truncated.Configuration()));
+        Assert.Equal(GeminiFailure.InvalidResponse, invalid.Failure);
+        var waited = new FakeGemini { ErrorBody = """{"error":{"code":429,"details":[{"retryDelay":"0s"}]}}""" };
+        waited.Statuses.Enqueue(429);
+        waited.Statuses.Enqueue(200);
+        await Gemini.Generate<JsonElement>([Gemini.Text("x")], new System.Text.Json.Nodes.JsonObject(), waited.Configuration());
+        Assert.Empty(waited.Statuses);
+    }
+
+    [Fact]
+    public async Task SelectionScoresEveryWindowAndKeepsTheStrongestLateMoment()
+    {
+        var gemini = new FakeGemini();
+        var cues = Enumerable.Range(0, 120).Select(i => new TimedCaption($"Complete story {i}.", i * 10, 8)).ToList();
+        var windows = TranscriptSelection.Windows(cues, (0, 1200));
+        foreach (var ids in TranscriptSelection.Batches(Enumerable.Range(0, windows.Count).ToList(), 6))
+            gemini.Payloads.Enqueue(JsonSerializer.Serialize(new { windows = ids.Select(id => new { id, score = (double)id }) }));
+        var shortlist = Math.Min(16, (int)(1200.0 / 90) + 2);
+        var best = Enumerable.Range(0, windows.Count).Reverse().Take(shortlist).ToList();
+        foreach (var ids in TranscriptSelection.Batches(best, 3))
+        {
+            var id = ids[0];
+            gemini.Payloads.Enqueue(JsonSerializer.Serialize(new { clips = new[] { new {
+                start = windows[id].Start - (id == windows.Count - 1 ? 1 : 0), end = windows[id].Start + 30,
+                score = id == windows.Count - 1 ? 10 : 7, layout = "fit", title = "t", reason = "r" } } }));
+        }
+        var video = await Media.Pictures();
+        var planned = await GeminiSelection.Select(video, cues, (0, 1200), 30, 1, gemini.Configuration(), concurrency: 1);
+        Assert.Equal(windows[^1].Start, planned[0].Start);
+        Assert.Equal(4, planned.Count);
+    }
+
+    [Fact]
+    public async Task TranscriptionRunsChunksSideBySideInOrderAndHandsBackFinishedStretches()
+    {
+        var audio = await Media.Silence();
+        var gemini = new FakeGemini();
+        gemini.Payloads.Enqueue("""{"words":[{"text":"bad","start":0,"end":16}]}""");
+        gemini.Payloads.Enqueue("""{"words":[{"text":"First.","start":0.1,"end":1}]}""");
+        gemini.Payloads.Enqueue("""{"words":[{"text":"Second.","start":0.1,"end":1}]}""");
+        gemini.Payloads.Enqueue("""{"words":[{"text":"Third.","start":0.1,"end":1}]}""");
+        var stretches = new List<string>();
+        var words = await GeminiSelection.Transcribe(audio, (0, 30), gemini.Configuration(), concurrency: 1,
+            finished: (w, end) => stretches.Add($"{w.Count}@{end}"));
+        Assert.Equal([0.1, 7.6, 15.1], words.Select(w => Math.Round(w.Start, 3)));
+        Assert.Equal(["2@15", "3@30"], stretches);
+        for (var i = 0; i < 4; i++) gemini.Payloads.Enqueue("""{"words":[{"text":"Word.","start":1,"end":2}]}""");
+        var parallel = await GeminiSelection.Transcribe(audio, (0, 60), gemini.Configuration());
+        Assert.Equal([1.0, 16, 31, 46], parallel.Select(w => w.Start));
+    }
+}
+
+public class MediaTests
+{
+    [Fact]
+    public async Task ProbeReportsDisplayedSizeAudioAndDuration()
+    {
+        var info = await FFmpeg.Probe(await Media.Pictures());
+        Assert.NotNull(info);
+        Assert.Equal((640, 360, true, true), (info.Width, info.Height, info.HasVideo, info.HasAudio));
+        Assert.InRange(info.Duration, 5.9, 6.1);
+        var rotated = await FFmpeg.Probe(await Media.Rotated());
+        Assert.Equal((640, 360), (rotated!.Width, rotated.Height));
+        Assert.Null(await FFmpeg.Probe(Path.Combine(TestSetup.Root, "missing.mp4")));
+    }
+
+    [Fact]
+    public async Task FramesGridsAndAudioComeOutOfOnePass()
+    {
+        var video = await Media.Pictures();
+        var frames = await FFmpeg.FramesJpeg(video, 1, 4, 1);
+        Assert.InRange(frames.Count, 4, 5);
+        Assert.Equal(0, frames[0].Time);
+        Assert.InRange((await FFmpeg.GrayGrids(video, 0, 2)).Count, 19, 21);
+        Assert.NotNull(await FFmpeg.AudioChunk(video, 1, 2));
+        var levels = await FFmpeg.AudioLevels(video, 0, 2);
+        Assert.InRange(levels!.Length, 198, 202);
+    }
+
+    [Fact]
+    public async Task CutsSnapIntoTheNearestPauseNeverIntoAWord()
+    {
+        var audio = await Media.Pauses();
+        var snapped = await ShortMaker.SilenceSnapped(audio, 2.55, 2.3, (0, 8));
+        Assert.InRange(snapped.Start, 2.0, 2.42);
+        Assert.InRange(snapped.Start + snapped.Duration, 5.0, 5.52);
+        Assert.Equal((0.8, 0.7), await ShortMaker.SilenceSnapped(audio, 0.8, 0.7, (0, 8)));
+        var protectedRange = await ShortMaker.SilenceSnapped(audio, 2.55, 2.3, (0, 8), [new TimedSpeechWord("pause", 1.9, 0.6)]);
+        Assert.Equal(2.55, protectedRange.Start);
+    }
+}
+
+public class FramingTests
+{
+    static FramingSample Sample(double time, double x, double? cut = null) => new(time, (x - 0.035, 0.07), cut);
+
+    [Fact]
+    public void StillSubjectsDontWobbleFastOnesStayInFrameAndCutsStayHard()
+    {
+        var still = Enumerable.Range(0, 30).Select(i => Sample(i * 0.12, 0.5 + (i % 2 == 0 ? 0.003 : -0.003))).ToList();
+        var steady = SubjectFramer.Plan(still, 3.6, 640, 360, 1.08);
+        Assert.True(steady.Max(p => p.Position) - steady.Min(p => p.Position) < 0.01);
+        var fast = Enumerable.Range(0, 12).Select(i => Sample(i * 0.12, 0.2 + Math.Min(1, i / 5.0) * 0.6)).ToList();
+        var follow = SubjectFramer.Plan(fast, 1.44, 640, 360, 1.08);
+        var visible = 1080.0 / (640 * (1920.0 / 360) * 1.08);
+        foreach (var point in follow.Where(p => p.Time < 1.32))
+        {
+            var x = 0.2 + Math.Min(1, point.Time / 0.12 / 5) * 0.6;
+            Assert.True(Math.Abs(x - (visible / 2 + point.Position * (1 - visible))) < visible / 2, "Camera lost a fast moving subject");
+        }
+        var cuts = SubjectFramer.Plan([Sample(0, 0.2), Sample(0.5, 0.2), Sample(1, 0.8, 0.95), Sample(1.5, 0.8)], 2, 640, 360, 1.08);
+        var cut = cuts.First(p => p.IsSceneCut == true);
+        Assert.Equal(0.95, cut.Time);
+        Assert.True(cut.Position > 0.85);
+    }
+
+    [Fact]
+    public void MovesEaseGlideAndNeverOvershoot()
+    {
+        var move = SubjectFramer.Eased([new(0, 0.2), new(1, 0.2), new(2, 0.8), new(3, 0.8)]);
+        var third = move.First(p => Math.Abs(p.Time - 4.0 / 3) < 0.001).Position;
+        Assert.InRange(third, 0.2001, 0.3999);
+        Assert.All(move, p => Assert.InRange(p.Position, 0.2, 0.8));
+        var glide = SubjectFramer.Eased([new(0, 0.1), new(1, 0.4), new(2, 0.7)]);
+        Assert.True(0.4 - glide.First(p => Math.Abs(p.Time - 2.0 / 3) < 0.001).Position > 0.05);
+        Assert.Equal(3, SubjectFramer.Eased([new(0, 0.1), new(1, 0.9, true), new(2, 0.9)]).Count);
+    }
+
+    [Fact]
+    public void CutsAreFoundBetweenSamples()
+    {
+        var dark = new byte[576];
+        var bright = Enumerable.Repeat((byte)230, 576).ToArray();
+        var grids = Enumerable.Range(0, 30).Select(i => i < 13 ? dark : bright).ToList();
+        var cuts = SubjectFramer.DetectCuts([0, 1, 2], grids);
+        // The cut falls between the 1 s and 2 s samples, so the 2 s sample reports it, pinned to 1.3 s.
+        Assert.Null(cuts[0]);
+        Assert.Null(cuts[1]);
+        Assert.Equal(1.3, cuts[2]);
+    }
+}
+
+public class RenderTests
+{
+    static async Task<(SKBitmapHolder Frame, MediaInfo Info)> Render(string source, EditSegment segment, ExportQuality quality = ExportQuality.Full, double at = 1)
+    {
+        var output = Path.Combine(TestSetup.Root, $"render-{Guid.NewGuid()}.mp4");
+        await Renderer.Export(source, segment, output, quality);
+        var info = await FFmpeg.Probe(output);
+        return (new SKBitmapHolder(await Media.Frame(output, at)), info!);
+    }
+
+    sealed record SKBitmapHolder(SkiaSharp.SKBitmap Bitmap);
+
+    [Fact]
+    public async Task EveryLayoutRendersVerticalShortsOfTheRightLength()
+    {
+        var video = await Media.Pictures();
+        foreach (var segment in new[]
+        {
+            new EditSegment { Start = 1, Duration = 3 },
+            new EditSegment { Start = 1, Duration = 3, FitToFrame = true },
+            new EditSegment { Start = 1, Duration = 3, SplitScreen = true, SplitCenters = [0.3, 0.7] },
+            new EditSegment { Start = 1, Duration = 3, CropKeyframes = [new(0, 0), new(1.5, 1, true), new(3, 0.5)] },
+        })
+        {
+            var (_, info) = await Render(video, segment);
+            Assert.Equal((1080, 1920), (info.Width, info.Height));
+            Assert.InRange(info.Duration, 2.9, 3.2);
+            Assert.True(info.HasAudio);
+        }
+    }
+
+    [Fact]
+    public async Task PhoneVideoKeepsItsOrientation()
+    {
+        var rotated = await Media.Rotated();
+        var truthFrame = await Media.Frame(rotated, 1);
+        var truth = string.Join(",", new[] { (0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75) }.Select(p => Media.Color(truthFrame, p.Item1, p.Item2)));
+        var (fit, _) = await Render(rotated, new EditSegment { Duration = 2, FitToFrame = true });
+        // Fit shows the whole 640×360 frame across 1080×607 in the middle of the 1920 height.
+        var top = (1920 - 607.5) / 2 / 1920;
+        var band = 607.5 / 1920;
+        var got = string.Join(",", new[] { (0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75) }.Select(p => Media.Color(fit.Bitmap, p.Item1, top + band * p.Item2)));
+        Assert.Equal(truth, got);
+    }
+
+    [Fact]
+    public async Task CaptionsShowOnlyDuringTheirTimeAndViralHighlightsTheSpokenWord()
+    {
+        var video = await Media.Gray();
+        var segment = new EditSegment
+        {
+            Duration = 3, Captions = [new TimedCaption("Hello there everyone", 1, 1.5)], CaptionStyle = CaptionStyle.Viral,
+            SpeechWords = [new("Hello", 1, 0.5), new("there", 1.5, 0.5), new("everyone", 2, 0.5)],
+        };
+        var output = Path.Combine(TestSetup.Root, $"captions-{Guid.NewGuid()}.mp4");
+        await Renderer.Export(video, segment, output);
+        static int Count(SkiaSharp.SKBitmap bitmap, Func<SkiaSharp.SKColor, bool> match)
+        {
+            var count = 0;
+            for (var y = (int)(bitmap.Height * 0.72); y < bitmap.Height * 0.86; y += 2)
+                for (var x = 0; x < bitmap.Width; x += 2)
+                    if (match(bitmap.GetPixel(x, y))) count++;
+            return count;
+        }
+        static bool Yellow(SkiaSharp.SKColor c) => c.Red > 200 && c.Green > 200 && c.Blue < 80;
+        var before = await Media.Frame(output, 0.5);
+        var during = await Media.Frame(output, 1.2);
+        Assert.True(Count(during, Yellow) > 50, "The spoken word must turn yellow");
+        Assert.True(Count(before, Yellow) < Count(during, Yellow) / 10, "Captions must not show before their time");
+    }
+
+    [Fact]
+    public async Task QualitySetsSizeAndCodecAndMuteDropsAudio()
+    {
+        var video = await Media.Pictures();
+        var (_, small) = await Render(video, new EditSegment { Duration = 2, IsMuted = true }, ExportQuality.Small);
+        Assert.Equal((720, 1280, false), (small.Width, small.Height, small.HasAudio));
+        if (!FFmpeg.HasEncoder("libx265")) return;
+        var output = Path.Combine(TestSetup.Root, $"hevc-{Guid.NewGuid()}.mp4");
+        await Renderer.Export(video, new EditSegment { Duration = 2 }, output, ExportQuality.Compact);
+        var probe = await FFmpeg.Run(FFmpeg.FFprobePath, ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0", output]);
+        Assert.Equal("hevc", System.Text.Encoding.UTF8.GetString(probe.Output).Trim());
+        await Assert.ThrowsAsync<ShortMakerException>(() => Renderer.Export(video, new EditSegment { Duration = 2 }, output));
+    }
+
+    [Fact]
+    public async Task PreviewsAreCachedUntilTheShortChanges()
+    {
+        var video = await Media.Pictures();
+        var segment = new EditSegment { Duration = 2 };
+        var first = await Renderer.Preview(video, segment);
+        Assert.Equal(first, await Renderer.Preview(video, segment));
+        segment.CropPosition = 0.2;
+        Assert.NotEqual(first, await Renderer.Preview(video, segment));
+        Assert.Equal((540, 960), await FFmpeg.Probe(first) is { } p ? (p.Width, p.Height) : default);
+    }
+
+    [Fact]
+    public void EveryStyleHasAPreview()
+    {
+        foreach (var style in CaptionStyles.Choices) Assert.True(CaptionRenderer.StylePreview(style).Length > 500, style.Title());
+    }
+}
+
+public class StorageTests
+{
+    [Fact]
+    public void ProjectsReadAndWriteTheMacOSFormat()
+    {
+        const string mac = """
+            {"id":"E621E1F8-C36C-495A-93FC-0C247A3E6E5F","name":"Video","media":[{"id":"11111111-2222-3333-4444-555555555555","path":"/Users/x/a.mov",
+             "kind":"video","duration":30.5,"width":1920,"height":1080,"note":"","priority":50,"created":782000000}],
+             "segments":[{"mediaID":"11111111-2222-3333-4444-555555555555","duration":12,"captionStyle":"highlightBox","captionPosition":"middle",
+             "cropKeyframes":[{"time":0,"position":0.5,"isSceneCut":true}]}],"memory":"","created":782000000.5,
+             "transcripts":{"11111111-2222-3333-4444-555555555555":{"start":0,"end":30,"cues":[{"text":"Hi.","start":1,"duration":2}]}}}
+            """;
+        var project = PrismJson.Deserialize<ProjectData>(mac)!;
+        var segment = project.Segments[0];
+        Assert.Equal(CaptionStyle.HighlightBox, segment.CaptionStyle);
+        Assert.Equal(1.08, segment.CropZoom);
+        Assert.Equal(0.5, segment.CropPosition);
+        Assert.Equal(project.Media[0].Id, segment.MediaId);
+        Assert.Equal(2025, project.Created.Year);
+        var written = PrismJson.Serialize(project);
+        Assert.Contains("\"mediaID\":\"11111111-2222-3333-4444-555555555555\"", written);
+        Assert.Contains("\"captionStyle\":\"highlightBox\"", written);
+        Assert.Contains("\"created\":782000000.5", written);
+        Assert.DoesNotContain("\"title\"", written);
+    }
+
+    [Fact]
+    public void OpeningAFolderThatIsNotAProjectLeavesNothingBehind()
+    {
+        var folder = Path.Combine(TestSetup.Root, $"not-a-project-{Guid.NewGuid()}");
+        Directory.CreateDirectory(folder);
+        Assert.Throws<StoreException>(() => new ProjectStore(folder, create: false));
+        Assert.Empty(Directory.GetFiles(folder));
+        var project = Path.Combine(TestSetup.Root, $"project-{Guid.NewGuid()}.relio");
+        using (var store = new ProjectStore(project)) store.Save(new ProjectData { Name = "Saved" }, "project");
+        Assert.Equal("Saved", ProjectStore.ReadProject(project)?.Name);
+    }
+}

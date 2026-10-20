@@ -2,6 +2,12 @@ import SwiftUI
 import AVKit
 import AppKit
 
+/// The natural height of the export card's Shorts list.
+private struct ExportListHeight: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
 private enum EditorStyle {
     static let canvas = Prism.surface0
     static let panel = Prism.surface1
@@ -44,13 +50,14 @@ extension ContentView {
             Button { model.undoFromEditor() } label: { Image(systemName: "arrow.uturn.backward") }.buttonStyle(.prismIcon)
                 .disabled(model.editHistory.isEmpty || model.isBusy).help("Undo edit · ⌘Z")
                 .accessibilityLabel("Undo edit")
-            Button { model.export() } label: {
+            Button { model.chooseExport() } label: {
                 Label("Export", systemImage: "square.and.arrow.up")
                     .font(Prism.text(12, .medium))
                     .padding(.horizontal, 18).padding(.vertical, 8)
                     .foregroundStyle(Prism.ink).background(Prism.action, in: RoundedRectangle(cornerRadius: 8))
-            }.buttonStyle(.plain).disabled(model.project?.segments.isEmpty != false || model.isBusy)
-                .accessibilityLabel("Export all Shorts")
+            }.buttonStyle(.plain).disabled(model.project?.media.isEmpty != false || model.isBusy)
+                .help("Choose which Shorts, the main video and the quality to export")
+                .accessibilityLabel("Export")
         }.padding(.horizontal, 20).frame(height: 54)
             .background(EditorStyle.panel)
             .overlay(alignment: .bottom) { EditorStyle.line.frame(height: 1) }
@@ -94,6 +101,99 @@ extension ContentView {
         }
     }
 
+    /// Pick the Shorts, the main video, the quality and the folder, then export.
+    func exportChoiceOverlay(_ choice: AppModel.ExportChoice) -> some View {
+        let clips = model.project?.segments ?? []
+        let binding = Binding(get: { model.exportChoice ?? choice }, set: { model.exportChoice = $0 })
+        let videos = model.project?.media.filter { $0.kind == "video" }.count ?? 0
+        let count = choice.shortIDs.count + (choice.includeSource ? videos : 0)
+        return ZStack {
+            Color.black.opacity(0.55).contentShape(Rectangle()).onTapGesture {}
+            VStack(alignment: .leading, spacing: 14) {
+                Label("Export", systemImage: "square.and.arrow.up").font(Prism.text(16, .medium))
+                HStack {
+                    Text("Shorts").font(Prism.text(12, .medium)).foregroundStyle(Prism.textSecondary)
+                    Spacer()
+                    if !clips.isEmpty {
+                        let all = choice.shortIDs.count == clips.count
+                        Button(all ? "Select none" : "Select all") {
+                            binding.wrappedValue.shortIDs = all ? [] : Set(clips.map(\.id))
+                        }.buttonStyle(.prismLink).foregroundStyle(EditorStyle.accent)
+                    }
+                }
+                if clips.isEmpty {
+                    Text("No Shorts yet. You can still export the main video.").font(Prism.text(12)).foregroundStyle(Prism.textSecondary)
+                } else {
+                    let rows = VStack(alignment: .leading, spacing: 6) {
+                            ForEach(Array(clips.enumerated()), id: \.element.id) { index, clip in
+                                Toggle(isOn: Binding(get: { binding.wrappedValue.shortIDs.contains(clip.id) },
+                                                     set: { on in if on { binding.wrappedValue.shortIDs.insert(clip.id) } else { binding.wrappedValue.shortIDs.remove(clip.id) } })) {
+                                    HStack {
+                                        Text("Short \(index + 1)").font(Prism.text(12, .medium))
+                                        Text(clip.suggestedTitle ?? "").font(Prism.text(12)).foregroundStyle(Prism.textSecondary).lineLimit(1)
+                                        Spacer()
+                                        Text(editorTime(clip.duration)).font(Prism.mono(11)).foregroundStyle(Prism.textSecondary)
+                                    }
+                                }
+                                .toggleStyle(.checkbox)
+                            }
+                        }
+                    // The list takes the room its Shorts need, and scrolls past 220 points.
+                    ScrollView {
+                        rows.background(GeometryReader { Color.clear.preference(key: ExportListHeight.self, value: $0.size.height) })
+                    }
+                    .frame(height: min(220, max(22, exportListHeight)))
+                    .onPreferenceChange(ExportListHeight.self) { height in Task { @MainActor in exportListHeight = height } }
+                }
+                Divider()
+                Toggle(isOn: binding.includeSource) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(videos > 1 ? "Main videos (\(videos))" : "Main video").font(Prism.text(12, .medium))
+                        Text("The original long video, copied as is.").font(Prism.text(11)).foregroundStyle(Prism.textSecondary)
+                    }
+                }.toggleStyle(.checkbox)
+                Divider()
+                Text("Quality").font(Prism.text(12, .medium)).foregroundStyle(Prism.textSecondary)
+                Picker("Quality", selection: binding.quality) {
+                    ForEach(ShortMaker.ExportQuality.allCases) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.segmented).labelsHidden()
+                Text(choice.quality.detail + " Applies to Shorts; the main video keeps its original quality.")
+                    .font(Prism.text(11)).foregroundStyle(Prism.textSecondary).fixedSize(horizontal: false, vertical: true)
+                Divider()
+                Text("Save to").font(Prism.text(12, .medium)).foregroundStyle(Prism.textSecondary)
+                HStack {
+                    Image(systemName: "folder").foregroundStyle(Prism.textSecondary)
+                    Text(AppModel.displayPath(choice.folder)).font(Prism.text(12)).lineLimit(1).truncationMode(.middle)
+                    Spacer()
+                    Button("Change…") {
+                        let panel = NSOpenPanel()
+                        panel.canChooseDirectories = true; panel.canChooseFiles = false; panel.canCreateDirectories = true
+                        panel.prompt = "Export here"
+                        if panel.runModal() == .OK, let url = panel.url { binding.wrappedValue.folder = url }
+                    }
+                }
+                .padding(10).background(EditorStyle.inset, in: RoundedRectangle(cornerRadius: 8))
+                if let error = choice.error {
+                    Label(error, systemImage: "exclamationmark.triangle").font(Prism.text(12)).foregroundStyle(Prism.amber)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                HStack {
+                    Button("Cancel") { model.exportChoice = nil }.controlSize(.large).keyboardShortcut(.cancelAction)
+                    Spacer()
+                    Button(count == 1 ? "Export 1 file" : "Export \(count) files") { model.export(choice) }
+                        .buttonStyle(.prismPrimary).keyboardShortcut(.defaultAction).disabled(count == 0)
+                }
+            }
+            .padding(24)
+            .frame(width: 480)
+            .background(EditorStyle.panel, in: RoundedRectangle(cornerRadius: 16))
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(EditorStyle.line))
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Export")
+        }
+    }
+
     func exportDoneOverlay(_ summary: String) -> some View {
         ZStack {
             Color.black.opacity(0.55).contentShape(Rectangle()).onTapGesture { model.exportSummary = nil }
@@ -101,7 +201,9 @@ extension ContentView {
                 Label("Export finished", systemImage: "checkmark.circle.fill")
                     .font(Prism.text(16, .medium)).foregroundStyle(Prism.accent)
                 Text(summary).font(Prism.text(13))
-                Text("1080 × 1920 · 30 fps · MP4, ready to upload.").font(Prism.text(12)).foregroundStyle(Prism.textSecondary)
+                if model.lastExportShortCount > 0 {
+                    Text("Shorts: \(model.lastExportQuality.resolution) · 30 fps · \(model.lastExportQuality.title.components(separatedBy: " · ").last ?? "H.264") MP4, ready to upload.").font(Prism.text(12)).foregroundStyle(Prism.textSecondary)
+                }
                 HStack {
                     Button("Done") { model.exportSummary = nil }
                         .controlSize(.large).keyboardShortcut(.cancelAction)
@@ -122,33 +224,43 @@ extension ContentView {
         }
     }
 
-    func generationErrorOverlay(_ error: String) -> some View {
-        let needsKey = error.contains("no API key is saved")
+    func generationErrorOverlay(_ failure: AppModel.GenerationFailure) -> some View {
+        let (title, advice): (String, String?) = switch failure.kind {
+        case .noMoments: ("No Shorts found", "Change the clip length or which part of the video Prism looks in, then try again.")
+        case .settings: ("Check your Gemini settings", nil)
+        case .temporary: ("Gemini is unavailable right now",
+                          "This is a temporary problem on Google’s side, not with your video or its range. Prism already retried for about a minute and tried the other Gemini models too. Wait a little, then try again.")
+        case .other: ("Couldn’t make Shorts", nil)
+        }
+        let tryAgain = { model.generationError = nil; model.makeConfiguredShorts() }
+        let leave = { (screen: AppModel.Screen) in model.generationError = nil; model.player?.pause(); model.screen = screen }
         return ZStack {
             Color.black.opacity(0.55).contentShape(Rectangle()).onTapGesture {}
             VStack(alignment: .leading, spacing: 14) {
-                Label(needsKey ? "Gemini key needed" : "No Shorts found", systemImage: "exclamationmark.triangle")
+                Label(title, systemImage: "exclamationmark.triangle")
                     .font(Prism.text(16, .medium)).foregroundStyle(Prism.amber)
-                Text(error).font(Prism.text(13)).fixedSize(horizontal: false, vertical: true)
-                if !needsKey {
-                    Text("Change the clip length or which part of the video Prism looks in, then try again.")
+                Text(failure.message).font(Prism.text(13)).fixedSize(horizontal: false, vertical: true)
+                if let advice {
+                    Text(advice)
                         .font(Prism.text(12)).foregroundStyle(Prism.textSecondary).fixedSize(horizontal: false, vertical: true)
                 }
                 HStack {
                     Button("Close") { model.generationError = nil }
                         .controlSize(.large).keyboardShortcut(.cancelAction)
                     Spacer()
-                    Button("Try again") {
-                        model.generationError = nil
-                        model.makeConfiguredShorts()
+                    switch failure.kind {
+                    case .noMoments, .settings:
+                        Button("Try again", action: tryAgain).controlSize(.large)
+                        Button(failure.kind == .settings ? "Open Settings" : "Change clip length or range") {
+                            leave(failure.kind == .settings ? .settings : .importSource)
+                        }
+                        .buttonStyle(.prismPrimary).keyboardShortcut(.defaultAction)
+                    case .temporary:
+                        Button("Change model") { leave(.settings) }.controlSize(.large)
+                        Button("Try again", action: tryAgain).buttonStyle(.prismPrimary).keyboardShortcut(.defaultAction)
+                    case .other:
+                        Button("Try again", action: tryAgain).buttonStyle(.prismPrimary).keyboardShortcut(.defaultAction)
                     }
-                    .controlSize(.large)
-                    Button(needsKey ? "Open Settings" : "Change clip length or range") {
-                        model.generationError = nil
-                        model.player?.pause()
-                        model.screen = needsKey ? .settings : .importSource
-                    }
-                    .buttonStyle(.prismPrimary).keyboardShortcut(.defaultAction)
                 }
             }
             .padding(24)
@@ -156,7 +268,7 @@ extension ContentView {
             .background(EditorStyle.panel, in: RoundedRectangle(cornerRadius: 16))
             .overlay(RoundedRectangle(cornerRadius: 16).stroke(EditorStyle.line))
             .accessibilityElement(children: .contain)
-            .accessibilityLabel("No Shorts found")
+            .accessibilityLabel(title)
         }
     }
 
@@ -196,6 +308,8 @@ private struct EditorShortcuts: View {
     var body: some View {
         Color.clear
             .onAppear {
+                // A second monitor would handle each key twice: Space would play and pause at once.
+                guard monitor == nil else { return }
                 monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
                     handle(event) ? nil : event
                 }
@@ -204,7 +318,7 @@ private struct EditorShortcuts: View {
     }
 
     @MainActor private func handle(_ event: NSEvent) -> Bool {
-        guard model.screen == .editor, model.generationProgress == nil, model.generationError == nil, model.exportSummary == nil,
+        guard model.screen == .editor, model.generationProgress == nil, model.generationError == nil, model.exportSummary == nil, model.exportChoice == nil,
               !(event.window?.firstResponder is NSText) else { return false }
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         switch (event.keyCode, modifiers) {
@@ -231,6 +345,7 @@ private struct EditorSidebarDivider: View {
     let onDrag: (CGFloat) -> Void
     @State private var lastTranslation: CGFloat = 0
     @State private var isHovering = false
+    @State private var cursorIsPushed = false
 
     var body: some View {
         // Zero layout thickness: the stack's 1px gap is the visible line; the overlay is a wider, invisible grab zone.
@@ -258,9 +373,11 @@ private struct EditorSidebarDivider: View {
             )
             .onHover { hovering in
                 isHovering = hovering
-                if hovering { (axis == .horizontal ? NSCursor.resizeLeftRight : NSCursor.resizeUpDown).push() }
-                else { NSCursor.pop() }
+                // Balanced push and pop, so the resize cursor can't get stuck or pop someone else's cursor.
+                if hovering, !cursorIsPushed { (axis == .horizontal ? NSCursor.resizeLeftRight : NSCursor.resizeUpDown).push(); cursorIsPushed = true }
+                else if !hovering, cursorIsPushed { NSCursor.pop(); cursorIsPushed = false }
             }
+            .onDisappear { if cursorIsPushed { NSCursor.pop(); cursorIsPushed = false } }
             .help(axis == .horizontal ? "Drag to resize sidebar" : "Drag to resize timeline")
             .accessibilityLabel(axis == .horizontal ? "Resize sidebar" : "Resize timeline")
     }
@@ -408,7 +525,8 @@ private struct EditorCaptionsPanel: View {
 private struct EditorMediaBin: View {
     @Bindable var model: AppModel
     @State private var tab = "Shorts"
-    @State private var shortPosters: [UUID: NSImage] = [:]
+    /// Each Short's poster and the source time it shows; a trimmed Short gets a new one.
+    @State private var shortPosters: [UUID: (seconds: Double, image: NSImage)] = [:]
     private let columns = [GridItem(.adaptive(minimum: 112), spacing: 10)]
     var body: some View {
         VStack(spacing: 0) {
@@ -440,7 +558,7 @@ private struct EditorMediaBin: View {
                                                 VStack(alignment: .leading, spacing: 5) {
                                                     ZStack(alignment: .bottomLeading) {
                                                         GeometryReader { geometry in
-                                                            if let poster = shortPosters[clip.id] {
+                                                            if let poster = shortPosters[clip.id]?.image {
                                                                 Image(nsImage: poster).resizable().scaledToFill()
                                                                     .frame(width: geometry.size.width, height: 82).clipped()
                                                             } else if let media = model.project?.media.first(where: { $0.id == clip.mediaID }) {
@@ -475,7 +593,7 @@ private struct EditorMediaBin: View {
                                             }.buttonStyle(.plain).accessibilityLabel("Preview Short \(index + 1)")
                                             .contextMenu {
                                                 Button("Preview") { model.selection = clip.mediaID; model.selectPreview(clip.id) }
-                                                Button("Export this Short") { model.export(only: clip.id) }
+                                                Button("Export this Short…") { model.chooseExport(only: clip.id) }
                                                 Divider()
                                                 Button("Remove Short") { model.removeShort(clip.id) }
                                             }
@@ -588,13 +706,14 @@ private struct EditorMediaBin: View {
             guard let media = model.project?.media.first(where: { $0.id == clip.mediaID }) else { return nil }
             return (clip.id, URL(fileURLWithPath: media.path), min(max(0.1, clip.start + clip.duration * 0.45), max(0.1, media.duration - 0.1)))
         } ?? []
-        for (id, url, seconds) in entries where shortPosters[id] == nil {
+        for (id, url, seconds) in entries where shortPosters[id].map({ abs($0.seconds - seconds) > 0.05 }) ?? true {
             let image = await Task.detached(priority: .utility) { () -> CGImage? in
                 let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
                 generator.appliesPreferredTrackTransform = true
+                generator.maximumSize = CGSize(width: 480, height: 480)
                 return try? generator.copyCGImage(at: CMTime(seconds: seconds, preferredTimescale: 600), actualTime: nil)
             }.value
-            if let image { shortPosters[id] = NSImage(cgImage: image, size: .zero) }
+            if let image { shortPosters[id] = (seconds, NSImage(cgImage: image, size: .zero)) }
         }
         let validIDs = Set(entries.map(\.0))
         shortPosters = shortPosters.filter { validIDs.contains($0.key) }
@@ -817,11 +936,11 @@ private struct EditorInspector: View {
                             Divider()
                             Toggle("Mute source audio", isOn: Binding(get: { model.activeSegment?.isMuted == true }, set: { _ in model.toggleSelectedAudio() }))
                                 .font(Prism.text(12)).toggleStyle(.switch).controlSize(.small)
-                            Button { model.export(only: clip.id) } label: {
+                            Button { model.chooseExport(only: clip.id) } label: {
                                 Label("Export this Short", systemImage: "square.and.arrow.up").frame(maxWidth: .infinity)
                             }
                             .buttonStyle(.prismSecondary)
-                            .help("Render only this Short to the Exports folder")
+                            .help("Choose quality and where this Short goes")
                         } else {
                             Image(systemName: "slider.horizontal.3").font(Prism.text(25)).foregroundStyle(Prism.textSecondary).padding(.top, 35)
                             Text("Select a clip to edit").font(Prism.text(13, .medium))

@@ -10,6 +10,8 @@ final class GeminiMockProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var bodies: [String] = []
     /// Sent instead of a Gemini answer when the status isn't 200, like a real quota error body.
     nonisolated(unsafe) static var errorBody: String?
+    /// The model each request was sent to, from the URL.
+    nonisolated(unsafe) static var models: [String] = []
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
@@ -26,6 +28,7 @@ final class GeminiMockProtocol: URLProtocol, @unchecked Sendable {
             stream.close()
         }
         Self.bodies.append(String(decoding: body, as: UTF8.self))
+        Self.models.append(String(request.url!.lastPathComponent.split(separator: ":")[0]))
         precondition(request.url?.query == nil, "Credentials must not be put in the URL")
         precondition(request.value(forHTTPHeaderField: "x-goog-api-key") == "test-key")
         let response = HTTPURLResponse(url: request.url!, statusCode: Self.statuses.isEmpty ? Self.status : Self.statuses.removeFirst(), httpVersion: nil, headerFields: nil)!
@@ -47,6 +50,11 @@ final class GeminiMockProtocol: URLProtocol, @unchecked Sendable {
 /// Collects the transcript the pipeline hands back for saving.
 final class TranscriptBox: @unchecked Sendable {
     var value: SentenceTranscript?
+}
+
+/// Collects retry announcements; one request retries sequentially, so there is no concurrent access.
+final class NoteBox: @unchecked Sendable {
+    var values: [String] = []
 }
 
 @main struct GeminiSelectionTests {
@@ -91,6 +99,17 @@ final class TranscriptBox: @unchecked Sendable {
             .init(id: 0, score: 20), .init(id: 1, score: 10), .init(id: 2, score: 95)
         ], expected: [0, 1, 2])
         precondition(ranking == [2, 0, 1], "Late moments must win by quality, not position")
+        let rated = try JSONDecoder().decode([GeminiSelection.WindowScore].self, from: Data("""
+            [{"id":0,"hook":9,"payoff":8,"standalone":9,"emotion":5,"novelty":6},
+             {"id":1,"hook":10,"payoff":9,"standalone":3,"emotion":9,"novelty":9},
+             {"id":2,"score":55}]
+            """.utf8))
+        precondition(abs(rated[0].score - 80.5) < 0.01 && rated[1].score < 70 && rated[2].score == 55,
+                     "Criteria must combine into one score, and a window that doesn't stand alone must fall below the clip line: \(rated.map(\.score))")
+        do {
+            _ = try JSONDecoder().decode(GeminiSelection.WindowScore.self, from: Data(#"{"id":0,"hook":11,"payoff":8,"standalone":9,"emotion":5,"novelty":6}"#.utf8))
+            preconditionFailure("Out-of-range criteria must be rejected")
+        } catch {}
         do {
             _ = try GeminiSelection.rankedWindowIDs([.init(id: 0, score: 50), .init(id: 0, score: 90)], expected: [0, 1])
             preconditionFailure("Duplicate or missing scoring ids must fail the complete pass")
@@ -131,9 +150,36 @@ final class TranscriptBox: @unchecked Sendable {
         } catch GeminiSelection.Failure.noDistinctClips { }
         let result: Check = try await GeminiSelection.generate(parts: [["text": "check"]], schema: [:], configuration: configuration, session: session)
         precondition(result.ok)
-        GeminiMockProtocol.statuses = [503, 200]
-        let recovered: Check = try await GeminiSelection.generate(parts: [], schema: [:], configuration: configuration, session: session)
-        precondition(recovered.ok && GeminiMockProtocol.statuses.isEmpty)
+        // An overloaded model gets several growing waits (shortened here), each announced; one that stays busy still fails.
+        GeminiSelection.retryWaits = [0.01, 0.01, 0.01, 0.01, 0.01]
+        let notes = NoteBox()
+        var announcing = configuration
+        announcing.onRetry = { notes.values.append($0) }
+        GeminiMockProtocol.statuses = [503, 503, 503, 500, 200]
+        let recovered: Check = try await GeminiSelection.generate(parts: [], schema: [:], configuration: announcing, session: session)
+        precondition(recovered.ok && GeminiMockProtocol.statuses.isEmpty && notes.values.count == 4
+                     && notes.values.allSatisfy { $0.hasPrefix("Gemini is busy") }, "A busy streak must be retried and shown: \(notes.values)")
+        let attemptsPerModel = GeminiSelection.retryWaits.count + 1
+        GeminiMockProtocol.statuses = Array(repeating: 503, count: attemptsPerModel * GeminiSelection.fallbackModels.count)
+        do {
+            let _: Check = try await GeminiSelection.generate(parts: [], schema: [:], configuration: configuration, session: session)
+            preconditionFailure("A server that stays busy on every model must fail instead of waiting forever")
+        } catch GeminiSelection.Failure.request(let code) { precondition(code == 503 && GeminiMockProtocol.statuses.isEmpty) }
+        // An overloaded model hands the request to the next model, says so, and that model goes first for the next requests.
+        let switches = NoteBox()
+        var falling = configuration
+        falling.onFallback = { from, to in switches.values.append("\(from)>\(to)") }
+        GeminiMockProtocol.models = []
+        GeminiMockProtocol.statuses = Array(repeating: 503, count: attemptsPerModel) + [200]
+        let rescued: Check = try await GeminiSelection.generate(parts: [], schema: [:], configuration: falling, session: session)
+        precondition(rescued.ok && switches.values == ["gemini-3.1-flash-lite>gemini-3.5-flash-lite"]
+                     && GeminiMockProtocol.models == Array(repeating: "gemini-3.1-flash-lite", count: attemptsPerModel) + ["gemini-3.5-flash-lite"],
+                     "A busy model must fall back to another model: \(GeminiMockProtocol.models)")
+        GeminiMockProtocol.models = []
+        let _: Check = try await GeminiSelection.generate(parts: [], schema: [:], configuration: falling, session: session)
+        precondition(GeminiMockProtocol.models == ["gemini-3.5-flash-lite"], "The working fallback must go first, not wait on the busy model again")
+        GeminiSelection.rememberWorking("gemini-3.1-flash-lite", for: "gemini-3.1-flash-lite")
+        print("PASS busy servers are retried, then other models are tried and the switch is reported")
         let audioURL = FileManager.default.temporaryDirectory.appendingPathComponent("relio-audio-test-\(UUID()).caf")
         defer { try? FileManager.default.removeItem(at: audioURL) }
         let format = AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1)!
@@ -148,9 +194,16 @@ final class TranscriptBox: @unchecked Sendable {
             "{\"words\":[{\"text\":\"Second.\",\"start\":0.1,\"end\":1}]}",
             "{\"words\":[{\"text\":\"Third.\",\"start\":0.1,\"end\":1}]}"
         ]
-        let recoveredWords = try await GeminiSelection.transcribe(url: audioURL, interval: (0, 30), configuration: configuration, session: session)
-        precondition(recoveredWords.count == 3 && abs(recoveredWords[1].start - 7.6) < 0.001 && abs(recoveredWords[2].start - 22.6) < 0.001 && GeminiMockProtocol.payloads.isEmpty,
-                     "Invalid long-chunk timing must recover in smaller chunks without losing absolute offsets")
+        let stretches = NoteBox()
+        let recoveredWords = try await GeminiSelection.transcribe(url: audioURL, interval: (0, 30), configuration: configuration, session: session,
+                                                                  concurrency: 1, finished: { words, end in stretches.values.append("\(words.count)@\(end)") })
+        precondition(recoveredWords.count == 3 && abs(recoveredWords[1].start - 7.6) < 0.001 && abs(recoveredWords[2].start - 15.1) < 0.001 && GeminiMockProtocol.payloads.isEmpty,
+                     "Invalid long-chunk timing must recover in smaller chunks without losing absolute offsets: \(recoveredWords)")
+        precondition(stretches.values == ["2@15.0", "3@30.0"], "Each finished stretch from the start must be handed back for saving: \(stretches.values)")
+        // Chunks run side by side, yet words come back in source order.
+        GeminiMockProtocol.payloads = (0..<4).map { _ in "{\"words\":[{\"text\":\"Word.\",\"start\":1,\"end\":2}]}" }
+        let parallelWords = try await GeminiSelection.transcribe(url: audioURL, interval: (0, 60), configuration: configuration, session: session)
+        precondition(parallelWords.map(\.start) == [1, 16, 31, 46] && GeminiMockProtocol.payloads.isEmpty, "Parallel chunks must keep source order: \(parallelWords.map(\.start))")
         GeminiMockProtocol.payloads = ["{\"segments\":[{\"text\":\"One complete sentence.\",\"start\":0.1,\"end\":10}]}"]
         let sentences = try await GeminiSelection.transcribeSentences(url: audioURL, interval: (0, 60), configuration: configuration, session: session)
         precondition(sentences.count == 1 && sentences[0].text == "One complete sentence." && sentences[0].start == 0.1,
@@ -252,7 +305,11 @@ final class TranscriptBox: @unchecked Sendable {
         // Gemini framing: a subject reported on the right moves the crop right; a failed request holds the crop steady.
         let framed: [String: Any] = ["wholeFrame": false, "frames": (0..<8).map { ["index": $0, "found": true, "center": 0.8, "width": 0.1, "faces": [0.8]] }]
         GeminiMockProtocol.payloads = [String(decoding: try JSONSerialization.data(withJSONObject: framed), as: UTF8.self)]
-        let path = await SubjectFramer.analyze(pipelineURL, start: 0, duration: 4, zoom: 1.08, configuration: configuration, session: session)
+        GeminiMockProtocol.bodies = []
+        let path = await SubjectFramer.analyze(pipelineURL, start: 0, duration: 4, zoom: 1.08, configuration: configuration,
+                                               speech: [TimedCaption(text: "Who is talking now?", start: 0.5, duration: 2)], session: session)
+        precondition(GeminiMockProtocol.bodies.last?.contains("Who is talking now?") == true && GeminiMockProtocol.bodies.last?.contains("Frame 1 at 0.5 s") == true,
+                     "Framing must see who talks when and each frame's time")
         precondition(!path.isEmpty && path.allSatisfy { $0.position > 0.6 }, "Gemini's subject position must steer the crop: \(path)")
         GeminiMockProtocol.payloads = ["not json"]
         let steady = await SubjectFramer.analyze(pipelineURL, start: 0, duration: 4, zoom: 1.08, configuration: configuration, session: session)
@@ -293,6 +350,23 @@ final class TranscriptBox: @unchecked Sendable {
         precondition(GeminiMockProtocol.statuses.isEmpty && GeminiMockProtocol.payloads.isEmpty)
         precondition(savedTranscript.value?.cues(covering: (0, 30)) == nil, "A transcript must not be reused for a longer range than it covers")
         print("PASS a saved transcript is reused on the next run, with no transcription request")
+        // A run that failed partway saved its first stretch; the next run transcribes only the rest.
+        GeminiMockProtocol.statuses = [200, 200, 200, 429]
+        GeminiMockProtocol.payloads = [
+            "{\"segments\":[{\"text\":\"With a useful ending.\",\"start\":0.5,\"end\":8}]}",
+            "{\"windows\":[{\"id\":0,\"score\":90}]}",
+            "{\"clips\":[{\"start\":1,\"end\":18,\"score\":9,\"layout\":\"fit\",\"title\":\"Complete story\",\"reason\":\"Hook and payoff.\"}]}",
+            "{}"
+        ]
+        let partial = SentenceTranscript(start: 0, end: 10, cues: [TimedCaption(text: "Here is a complete story.", start: 1, duration: 8)])
+        let resumedBox = TranscriptBox()
+        let resumed = try await ShortMaker.analyze(pipelineURL, requestedDuration: 15, count: 1, sourceRegion: .entireVideo,
+            gemini: cloudConfiguration, cachedTranscript: partial, onTranscript: { resumedBox.value = $0 })
+        precondition(resumedBox.value?.cues.map(\.text) == ["Here is a complete story.", "With a useful ending."]
+                     && resumedBox.value?.cues.last?.start == 10.5 && resumedBox.value?.end == 20 && GeminiMockProtocol.payloads.isEmpty,
+                     "A partly saved transcript must be resumed, not redone: \(String(describing: resumedBox.value))")
+        precondition(resumed.count == 1)
+        print("PASS a transcription that failed partway resumes from its saved stretch")
         // Auto-detect asks once, then the detected type steers both picking prompts; a bad answer means "general".
         let windowsReply = "{\"windows\":[{\"id\":0,\"score\":90}]}"
         let clipsReply = "{\"clips\":[{\"start\":1,\"end\":19,\"score\":9,\"layout\":\"fit\",\"title\":\"Complete story\",\"reason\":\"Hook and payoff.\"}]}"
