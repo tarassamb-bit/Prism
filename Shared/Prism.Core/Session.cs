@@ -13,7 +13,7 @@ public enum GenerationFailureKind { NoMoments, Settings, Temporary, Other }
 
 /// <summary>Why the last Shorts run produced nothing. The popup's title, advice and buttons follow <see cref="Kind"/>,
 /// so a busy server is never blamed on the video or its range.</summary>
-public sealed record GenerationFailure(string Message, GenerationFailureKind Kind);
+public sealed record GenerationFailure(string Message, GenerationFailureKind Kind, bool IsExport = false);
 
 /// <summary>What the export card is set to.</summary>
 public sealed record ExportChoice(IReadOnlySet<Guid> ShortIds, bool IncludeSource, ExportQuality Quality, string Folder, string? Error = null);
@@ -21,7 +21,7 @@ public sealed record ExportChoice(IReadOnlySet<Guid> ShortIds, bool IncludeSourc
 /// Everything the Prism window shows and does, independent of the toolkit: the Windows (WPF) and Linux (GTK) apps both drive
 /// this one object, a port of the macOS app's AppModel. Call it from the UI thread; it reports changes through PropertyChanged
 /// on the UI thread.
-public sealed partial class AppSession : INotifyPropertyChanged
+public sealed partial class AppSession : INotifyPropertyChanged, IDisposable
 {
     public event PropertyChangedEventHandler? PropertyChanged;
     readonly SynchronizationContext? context;
@@ -283,6 +283,25 @@ public sealed partial class AppSession : INotifyPropertyChanged
         return cachedGeminiKey;
     }
 
+    /// <summary>Reconcile the welcome card with the actual platform key store at app startup.</summary>
+    public void RefreshGeminiKeyState()
+    {
+        IsGeminiKeySaved = GeminiApiKey().Length > 0;
+        Settings.GeminiKeySaved = IsGeminiKeySaved;
+        Settings.Save();
+        if (!IsGeminiKeySaved) GeminiKeyStatus = "";
+    }
+
+    public void Dispose()
+    {
+        generationCancellation?.Cancel();
+        previewCancellation?.Cancel();
+        Player?.Clear();
+        store?.Dispose();
+        store = null;
+        project = null;
+    }
+
     /// <summary>Null when no key is saved. Every task shows its retries while they happen, and a switch to another model is
     /// added to the task's final message (<see cref="WithModelNote"/>).</summary>
     public GeminiConfiguration? GeminiConfiguration()
@@ -392,7 +411,7 @@ public sealed partial class AppSession : INotifyPropertyChanged
         }
         IsTestingGemini = false;
         SaveGeminiKey();
-        if (unconfirmed is not null) GeminiKeyStatus = unconfirmed;
+        if (unconfirmed is not null && IsGeminiKeySaved && GeminiKey.Length == 0) GeminiKeyStatus = unconfirmed;
     }
 
     public async Task TestGeminiKey()

@@ -76,6 +76,17 @@ open macOS/dist/Prism.app
 
 > **Keychain prompts after every rebuild?** Run `zsh macOS/scripts/create-signing-identity.sh` once. See [Packaging and signing](#packaging-and-signing).
 
+### Windows and Linux
+
+Native ports are in [Windows](Windows/README.md) (WPF) and [Linux](Linux/README.md) (GTK4/Gir.Core). They share a .NET 10 Gemini/ffmpeg engine and app model in `Shared/Prism.Core`, including Home folders, the create flow, captions, focus editing, chat and export cards. Their libraries and credentials are separate from macOS.
+
+```sh
+dotnet build Prism.sln
+dotnet test Shared/Prism.Core.Tests  # requires ffmpeg and ffprobe
+```
+
+The native ports compile on the development Mac. Desktop playback, layout and platform services still need verification on real Windows/Linux machines; each platform guide includes dependencies, launch commands and a check list.
+
 ## How a Short is made
 
 ```

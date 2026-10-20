@@ -13,6 +13,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.13" />
     <ProjectReference Include="..\..\Shared\Prism.Core\Prism.Core.csproj" />
   </ItemGroup>
 

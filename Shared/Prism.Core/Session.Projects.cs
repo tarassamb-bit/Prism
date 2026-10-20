@@ -10,6 +10,7 @@ public sealed partial class AppSession
     void ResetPreview()
     {
         previewCancellation?.Cancel();
+        Player?.Clear();
         Selection = null;
         PreviewShortId = null;
         PreviewPath = null;
@@ -381,6 +382,10 @@ public sealed partial class AppSession
         var unsafeCharacters = "/\\:*?\"<>|";
         var cleaned = new string((title ?? "").Select(c => unsafeCharacters.Contains(c) || char.IsControl(c) ? ' ' : c).ToArray());
         cleaned = string.Join(" ", cleaned.Split(' ', StringSplitOptions.RemoveEmptyEntries)).Trim('.', ' ');
+        var stem = cleaned.Split('.')[0].TrimEnd().ToUpperInvariant();
+        if (stem is "CON" or "PRN" or "AUX" or "NUL" or "CONIN$" or "CONOUT$"
+            || stem.Length == 4 && (stem.StartsWith("COM", StringComparison.Ordinal) || stem.StartsWith("LPT", StringComparison.Ordinal))
+                && stem[3] is >= '1' and <= '9') cleaned = "_" + cleaned;
         return cleaned.Length == 0 ? null : cleaned.Length > 80 ? cleaned[..80] : cleaned;
     }
 

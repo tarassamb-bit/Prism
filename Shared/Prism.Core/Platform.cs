@@ -29,6 +29,8 @@ public interface IPreviewPlayer
     double CurrentTime { get; }
     void Seek(double seconds);
     void TogglePlayback();
+    /// <summary>Synchronously release the current file before its project is moved or closed.</summary>
+    void Clear() { }
 }
 
 /// RAM and disk use for the sidebar.
