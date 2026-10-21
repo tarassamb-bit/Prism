@@ -1,0 +1,4 @@
+#!/bin/sh
+# AppImage entry point. GTK 4 comes from the system; .NET and ffmpeg ship inside the image.
+here="$(dirname "$(readlink -f "$0")")"
+exec "$here/usr/bin/Prism.Linux" "$@"
