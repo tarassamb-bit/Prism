@@ -1,0 +1,96 @@
+# Builds Prism for macOS, Windows and Linux on their own systems and publishes them as one GitHub Release.
+# Start it by pushing a version tag:  git tag v0.2.0 && git push origin v0.2.0
+# File names stay the same in every release, so .../releases/latest/download/<name> always points at the newest build.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      # The runner's default Xcode 16.4 SDK fails with "redefinition of module"; the newest installed Xcode builds.
+      - name: Use the newest Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)" && xcodebuild -version
+      - name: Build Prism.app
+        run: zsh macOS/scripts/package-app.sh
+      - name: Make the DMG
+        run: |
+          mkdir stage
+          cp -R macOS/dist/Prism.app stage/
+          ln -s /Applications stage/Applications
+          hdiutil create -volname Prism -srcfolder stage -format UDZO -ov Prism-macOS.dmg
+      - uses: actions/upload-artifact@v4
+        with: { name: macos, path: Prism-macOS.dmg }
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: "10.0.x" }
+      - name: Publish Prism
+        run: dotnet publish Windows/Prism.Windows -c Release -r win-x64 --self-contained -p:DebugType=none -o dist/windows
+      - name: Add ffmpeg
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg
+          $root = Get-ChildItem ffmpeg -Directory | Select-Object -First 1
+          Copy-Item "$($root.FullName)\bin\ffmpeg.exe", "$($root.FullName)\bin\ffprobe.exe" dist/windows/
+          Copy-Item "$($root.FullName)\LICENSE" dist/windows/FFMPEG-LICENSE.txt
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\iscc.exe" "/DAppVersion=$version" Windows/packaging/Prism.iss
+      - uses: actions/upload-artifact@v4
+        with: { name: windows, path: dist/Prism-Windows-Setup.exe }
+
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: "10.0.x" }
+      - name: Publish Prism
+        run: dotnet publish Linux/Prism.Linux -c Release -r linux-x64 --self-contained -p:DebugType=none -o AppDir/usr/bin
+      - name: Add ffmpeg
+        run: |
+          curl -L -o ffmpeg.tar.xz https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
+          mkdir ffmpeg && tar -xf ffmpeg.tar.xz -C ffmpeg --strip-components=1
+          cp ffmpeg/ffmpeg ffmpeg/ffprobe AppDir/usr/bin/
+          cp ffmpeg/GPLv3.txt AppDir/usr/bin/FFMPEG-LICENSE.txt
+      - name: Build the AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          ARCH: x86_64
+        run: |
+          cp Linux/packaging/AppRun Linux/packaging/prism.desktop AppDir/
+          chmod +x AppDir/AppRun
+          cp macOS/assets/readme/icon.png AppDir/prism.png
+          curl -L -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          ./appimagetool AppDir Prism-Linux-x86_64.AppImage
+      - uses: actions/upload-artifact@v4
+        with: { name: linux, path: Prism-Linux-x86_64.AppImage }
+
+  release:
+    needs: [macos, windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: files, merge-multiple: true }
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd files
+          sha256sum * > SHA256SUMS.txt
+          gh release create "${{ github.ref_name }}" * --repo "${{ github.repository }}" --title "Prism ${{ github.ref_name }}" --generate-notes

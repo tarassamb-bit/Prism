@@ -137,7 +137,8 @@ public static class SubjectFramer
                 f.GetProperty("width").GetDouble(), f.GetProperty("faces").EnumerateArray().Select(x => x.GetDouble()).ToList())).ToList();
             return new Located(frames, result.GetProperty("wholeFrame").GetBoolean());
         }
-        catch (OperationCanceledException) { throw; }
+        // A request timeout is also an OperationCanceledException; it counts as a failure, so framing holds steady.
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { throw; }
         catch (Exception) { return null; }
     }
 

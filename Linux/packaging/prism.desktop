@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Prism
+Comment=Turn one long video into vertical Shorts
+Exec=Prism.Linux
+Icon=prism
+Categories=AudioVideo;Video;
+Terminal=false

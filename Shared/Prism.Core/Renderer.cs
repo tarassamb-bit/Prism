@@ -153,7 +153,8 @@ public static class Renderer
         return Invariant($"[0:v]fps=30,scale={scaledWidth}:{scaledHeight}:flags=bicubic,crop=1080:1920:x='{x}':y={y}[picture]");
     }
 
-    static int Even(double value) => Math.Max(2, (int)Math.Round(value / 2) * 2);
+    /// Rounds down: rounding to nearest made an odd source size like 1083 into a 1084 crop, larger than the frame.
+    static int Even(double value) => Math.Max(2, (int)Math.Floor(value / 2) * 2);
 
     /// <summary>The crop's left edge over time: the eased camera path, offset by the tracking bias, holding until each scene cut.</summary>
     public static string PanExpression(IReadOnlyList<CropKeyframe> keyframes, double duration, double bias, double pan)

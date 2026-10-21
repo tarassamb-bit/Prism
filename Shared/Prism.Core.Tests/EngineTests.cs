@@ -18,6 +18,25 @@ public class SelectionTests
     }
 
     [Fact]
+    public async Task ARequestTimeoutFailsTheMapInsteadOfLeavingGaps()
+    {
+        // HttpClient reports a timeout as TaskCanceledException even though nobody cancelled.
+        await Assert.ThrowsAsync<TaskCanceledException>(() => Concurrency.Map([1, 2, 3, 4], async (item, token) =>
+        {
+            await Task.Yield();
+            return item == 2 ? throw new TaskCanceledException() : item.ToString();
+        }, CancellationToken.None, limit: 2));
+    }
+
+    [Fact]
+    public void OddSourceSizesNeverCropPastTheFrame()
+    {
+        var layout = Renderer.Layout(new EditSegment { Duration = 10, SplitScreen = true }, 1919, 1083);
+        Assert.Contains("crop=958:1082:", layout);
+        Assert.DoesNotContain(":1084:", layout);
+    }
+
+    [Fact]
     public void BatchesAreBalanced()
     {
         var batches = TranscriptSelection.Batches(Enumerable.Range(0, 13).ToList(), 6);
