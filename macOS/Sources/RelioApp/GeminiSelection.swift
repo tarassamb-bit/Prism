@@ -386,9 +386,10 @@ enum GeminiSelection {
         generator.maximumSize = CGSize(width: 640, height: 360)
         let frameWindows = allowedWindows.isEmpty ? [interval] : allowedWindows
         let perWindow = max(1, 12 / frameWindows.count)
-        let times = frameWindows.flatMap { window in (0..<perWindow).map {
-            window.start + (window.end - window.start) * (Double($0) + 0.5) / Double(perWindow)
-        } }
+        let times: [Double] = frameWindows.flatMap { window -> [Double] in
+            let step = (window.end - window.start) / Double(perWindow)
+            return (0..<perWindow).map { window.start + step * (Double($0) + 0.5) }
+        }
         for time in times {
             try Task.checkCancellation()
             guard let frame = try? generator.copyCGImage(at: CMTime(seconds: time, preferredTimescale: 600), actualTime: nil),
