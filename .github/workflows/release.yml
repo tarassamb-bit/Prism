@@ -15,6 +15,9 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      # The runner's default Xcode 16.4 SDK fails with "redefinition of module"; the newest installed Xcode builds.
+      - name: Use the newest Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)" && xcodebuild -version
       - name: Build Prism.app
         run: zsh macOS/scripts/package-app.sh
       - name: Make the DMG
