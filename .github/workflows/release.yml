@@ -15,13 +15,13 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      # The runner also has Command Line Tools; mixing their SDK with Xcode's fails with "redefinition of module".
+      # Homebrew's sqlite3.pc on the runner adds the Command Line Tools SDK headers, which clash with Xcode's SDK
+      # ("redefinition of module"). A bare sqlite3.pc links the SDK's own libsqlite3 instead.
       - name: Build Prism.app
         run: |
-          export DEVELOPER_DIR="$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)/Contents/Developer"
-          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
-          xcrun swift --version
-          export PATH="$(dirname "$(xcrun -f swift)"):$PATH"
+          mkdir -p "$RUNNER_TEMP/pkgconfig"
+          printf 'Name: sqlite3\nDescription: SQLite from the macOS SDK\nVersion: 3\nLibs: -lsqlite3\nCflags:\n' > "$RUNNER_TEMP/pkgconfig/sqlite3.pc"
+          export PKG_CONFIG_LIBDIR="$RUNNER_TEMP/pkgconfig" PKG_CONFIG_PATH="$RUNNER_TEMP/pkgconfig"
           zsh macOS/scripts/package-app.sh
       - name: Make the DMG
         run: |
