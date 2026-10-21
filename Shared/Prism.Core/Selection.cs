@@ -31,7 +31,9 @@ public static class Concurrency
             }
             catch (Exception error)
             {
-                if (error is not OperationCanceledException || cancellation.IsCancellationRequested)
+                // Only a stop caused by another worker's failure is skipped. A request timeout is also an OperationCanceledException,
+                // and skipping it would return null results for the items that never finished.
+                if (error is not OperationCanceledException || !linked.IsCancellationRequested)
                     Interlocked.CompareExchange(ref firstFailure, ExceptionDispatchInfo.Capture(error), null);
                 linked.Cancel();
             }
@@ -113,7 +115,7 @@ public static class GeminiSelection
             var name = result.GetProperty("type").GetString();
             return Enum.TryParse<VideoType>(name, ignoreCase: true, out var type) && type != VideoType.Auto ? type : VideoType.General;
         }
-        catch (OperationCanceledException) { throw; }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { throw; }
         catch (Exception) { return VideoType.General; }
     }
 
@@ -242,7 +244,8 @@ public static class GeminiSelection
                 var clips = await SelectDetailed(path, selectedCues, bounds, targetDuration, Math.Min(10, count + 2), configuration, excluding, guidance, allowed, token);
                 return (Clips: clips, Error: (Exception?)null);
             }
-            catch (OperationCanceledException) { throw; }
+            // A timed-out request is one failed batch; only a real stop ends the pass.
+            catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
             catch (Exception error) { return (Clips: new List<Clip>(), Error: error); }
         }, cancellation, concurrency, (_, _) =>
         {
@@ -299,7 +302,7 @@ public static class GeminiSelection
                 .Where(id => id >= 0 && id < pool.Count && seen.Add(id)).Take(count).Select(id => pool[id]).ToList();
             return picked.Count == 0 ? null : picked;
         }
-        catch (OperationCanceledException) { throw; }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { throw; }
         catch (Exception) { return null; }
     }
 
