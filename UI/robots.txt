@@ -1,0 +1,21 @@
+# Search engines and AI crawlers are welcome on public pages.
+User-agent: *
+Disallow: /dashboard
+Disallow: /login
+Disallow: /signup
+Disallow: /account
+Disallow: /welcome
+Disallow: /api/
+
+User-agent: GPTBot
+User-agent: ClaudeBot
+User-agent: PerplexityBot
+User-agent: Google-Extended
+Disallow: /dashboard
+Disallow: /login
+Disallow: /signup
+Disallow: /account
+Disallow: /welcome
+Disallow: /api/
+
+Sitemap: https://prismclips.app/sitemap.xml

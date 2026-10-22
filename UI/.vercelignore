@@ -1,0 +1,4 @@
+# Never deploy hidden files (.env.local holds secret keys) or local-only tools.
+.*
+dev-server.js
+selfcheck.js
