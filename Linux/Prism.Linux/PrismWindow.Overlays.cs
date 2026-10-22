@@ -34,11 +34,12 @@ public sealed partial class PrismWindow
         };
         var dim = Column(0);
         dim.AddCssClass("scrim");
+        if (desired == "key") dim.AddCssClass("gate");
         dim.Hexpand = true;
         dim.Vexpand = true;
         var above = Column(0); above.Vexpand = true;
         var below = Column(0); below.Vexpand = true;
-        card.SetSizeRequest(510, -1);
+        card.SetSizeRequest(desired == "key" ? 500 : 460, -1);
         var viewport = Scroll(card);
         viewport.Vexpand = false;
         viewport.Hexpand = false;
@@ -55,18 +56,36 @@ public sealed partial class PrismWindow
         updateModal?.Invoke();
     }
 
-    static Gtk.Box ModalCard(string title)
+    /// The Mac app's popup card: a 16 pt title with an optional tinted icon.
+    static Gtk.Box ModalCard(string title, string? icon = null, string? tint = null)
     {
-        var card = Column(16);
+        var card = Column(14);
         card.AddCssClass("modal");
-        card.Append(Text(title, "subtitle"));
+        var heading = Row(10);
+        if (icon is not null) { var mark = Icon(icon, 16); if (tint is not null) mark.AddCssClass(tint); heading.Append(mark); }
+        var label = Text(title, "t16", "medium");
+        if (tint is not null) label.AddCssClass(tint);
+        heading.Append(label);
+        card.Append(heading);
         return card;
+    }
+
+    /// Secondary action left, the rest right: the Mac popups' footer.
+    static Gtk.Box Footer(Gtk.Widget left, params Gtk.Widget[] right)
+    {
+        var row = Row(8);
+        row.MarginTop = 6;
+        row.Append(left);
+        row.Append(Spacer());
+        foreach (var widget in right) row.Append(widget);
+        return row;
     }
 
     Gtk.Box KeyGate()
     {
-        var card = ModalCard("Welcome to Prism");
-        card.Prepend(BrandMark());
+        var card = Column(14);
+        card.AddCssClass("modal");
+        card.Append(BrandMark());
         card.Append(Text("Prism uses Google Gemini to find, cut, caption and frame your Shorts, so it needs your own Gemini API key before it can work. Google bills your AI Studio account for what Prism uses; the free tier works too.", "muted"));
         card.Append(Text("1. Create a key"));
         card.Append(Button("Open Google AI Studio › API keys", () => LinuxPlatform.OpenExternal("https://aistudio.google.com/apikey")));
@@ -79,6 +98,7 @@ public sealed partial class PrismWindow
         card.Append(feedback);
         card.Append(Text("The key stays in your desktop keyring, or a private configuration file when the keyring is unavailable. Audio, transcripts and sampled frames from your videos are sent to Google.", "muted"));
         var save = Button("Save and continue", async () => await session.VerifyAndSaveGeminiKey(), "primary");
+        save.Halign = Gtk.Align.End;
         card.Append(save);
         updateModal = () =>
         {
@@ -93,22 +113,26 @@ public sealed partial class PrismWindow
 
     Gtk.Box ProgressCard()
     {
-        var card = ModalCard(session.IsExporting ? "Exporting" : "Creating Shorts");
-        var stage = Text(session.GenerationStage);
+        var card = Column(14);
+        card.AddCssClass("modal");
+        var stage = Label(session.GenerationStage, "t14", "medium");
+        stage.Ellipsize = Pango.EllipsizeMode.End;
+        stage.Hexpand = true;
+        var percent = Label("", "mono");
+        var top = Row(8);
+        top.Append(stage); top.Append(percent);
         var progress = Gtk.ProgressBar.New();
-        progress.ShowText = true;
-        var detail = Text("", "mono");
-        card.Append(stage);
+        var detail = Label("", "mono");
+        card.Append(top);
         card.Append(progress);
-        card.Append(detail);
         card.Append(Text(session.IsExporting ? "Your files are being prepared for export." : "Gemini finds complete moments, aligns speech and follows the subject.", "muted"));
         var cancel = Button("Cancel", session.CancelGeneration);
-        card.Append(cancel);
+        card.Append(Footer(detail, cancel));
         updateModal = () =>
         {
             stage.SetText(session.GenerationStage);
             progress.Fraction = Math.Clamp(session.GenerationProgress ?? 0, 0, 1);
-            progress.Text = $"{progress.Fraction * 100:0}%";
+            percent.SetText($"{progress.Fraction * 100:0}%");
             detail.SetText($"Elapsed {Format.Clock((DateTime.Now - session.GenerationStartedAt).TotalSeconds)}");
             cancel.Sensitive = session.GenerationStage != "Cancelling…";
         };
@@ -135,40 +159,39 @@ public sealed partial class PrismWindow
             GenerationFailureKind.NoMoments => "No Shorts found", GenerationFailureKind.Settings => "Check your Gemini settings",
             GenerationFailureKind.Temporary => "Gemini is unavailable right now", _ => "Couldn’t make Shorts",
         };
-        var card = ModalCard(title);
+        var card = ModalCard(title, "dialog-warning-symbolic", "warning");
         card.Append(Text(failure.Message));
         if (!failure.IsExport && failure.Kind == GenerationFailureKind.NoMoments)
             card.Append(Text("Change the clip length or which part of the video Prism looks in, then try again.", "muted"));
         if (!failure.IsExport && failure.Kind == GenerationFailureKind.Temporary)
             card.Append(Text("This is a temporary problem on Google’s side, not with your video or its range. Prism already retried for about a minute and tried the other Gemini models too. Wait a little, then try again.", "muted"));
-        var buttons = Row();
-        buttons.Append(Button("Close", () => session.GenerationError = null));
+        var buttons = new List<Gtk.Widget>();
         if (failure.IsExport)
-            buttons.Append(Button("Export options", () => { session.GenerationError = null; session.ChooseExport(); }, "primary"));
+            buttons.Add(Button("Export options", () => { session.GenerationError = null; session.ChooseExport(); }, "primary"));
         else
         {
             if (failure.Kind == GenerationFailureKind.Temporary)
-                buttons.Append(Button("Change model", () => { session.GenerationError = null; Navigate(Screen.Settings); }));
-            buttons.Append(Button("Try again", async () => { session.GenerationError = null; await session.MakeConfiguredShorts(); },
+                buttons.Add(Button("Change model", () => { session.GenerationError = null; Navigate(Screen.Settings); }));
+            buttons.Add(Button("Try again", async () => { session.GenerationError = null; await session.MakeConfiguredShorts(); },
                 failure.Kind is GenerationFailureKind.Temporary or GenerationFailureKind.Other ? "primary" : null));
             if (failure.Kind is GenerationFailureKind.Settings or GenerationFailureKind.NoMoments)
-                buttons.Append(Button(failure.Kind == GenerationFailureKind.Settings ? "Open Settings" : "Change clip length or range", () =>
+                buttons.Add(Button(failure.Kind == GenerationFailureKind.Settings ? "Open Settings" : "Change clip length or range", () =>
                 {
                     session.GenerationError = null;
                     Navigate(failure.Kind == GenerationFailureKind.Settings ? Screen.Settings : Screen.ImportSource);
                 }, "primary"));
         }
-        card.Append(buttons);
+        card.Append(Footer(Button("Close", () => session.GenerationError = null), buttons.ToArray()));
         return card;
     }
 
     Gtk.Box ExportDoneCard(string summary)
     {
-        var card = ModalCard(summary.StartsWith("Export cancelled", StringComparison.Ordinal) ? "Export cancelled" : "Export finished");
+        var card = summary.StartsWith("Export cancelled", StringComparison.Ordinal) ? ModalCard("Export cancelled") : ModalCard("Export finished", "object-select-symbolic", "accent");
         card.Append(Text(summary));
         if (session.LastExportShortCount > 0)
             card.Append(Text($"Shorts: {session.LastExportQuality.Resolution()} · 30 fps · {session.LastExportQuality.Codec()} MP4, ready to upload.", "muted"));
-        card.Append(FlowButtons(Button("Done", () => session.ExportSummary = null), Button("Show in file manager", () =>
+        card.Append(Footer(Button("Done", () => session.ExportSummary = null), Button("Show in file manager", () =>
         { session.ExportSummary = null; session.RevealExports(); }, "primary")));
         return card;
     }
@@ -176,7 +199,7 @@ public sealed partial class PrismWindow
     Gtk.Box ExportCard()
     {
         var initial = session.ExportChoice!;
-        var card = ModalCard("Export");
+        var card = ModalCard("Export", "document-send-symbolic");
         var clips = session.Project?.Segments ?? [];
         var selected = initial.ShortIds.ToHashSet();
         var checks = new Dictionary<Guid, Gtk.CheckButton>();
@@ -184,13 +207,22 @@ public sealed partial class PrismWindow
         {
             var active = checks.Values.Any(check => !check.Active);
             foreach (var check in checks.Values) check.Active = active;
-        });
-        card.Append(FlowButtons(Text("Shorts", "muted"), all));
+        }, "link accent");
+        var shortsLabel = Label("Shorts", "muted", "medium");
+        card.Append(Footer(shortsLabel, all));
         var rows = Column(8);
         if (clips.Count == 0) rows.Append(Text("No Shorts yet. You can still export the main video.", "muted"));
         foreach (var (clip, index) in clips.Select((clip, index) => (clip, index)))
         {
-            var checkbox = Gtk.CheckButton.NewWithLabel($"Short {index + 1} · {clip.SuggestedTitle} · {Format.Clock(clip.Duration)}");
+            var line = Row(8);
+            line.Append(Label($"Short {index + 1}", "t12", "medium"));
+            var name = Label(clip.SuggestedTitle ?? "", "muted");
+            name.Ellipsize = Pango.EllipsizeMode.End;
+            name.Hexpand = true;
+            line.Append(name);
+            line.Append(Label(Format.Clock(clip.Duration), "mono"));
+            var checkbox = Gtk.CheckButton.New();
+            checkbox.Child = line;
             checkbox.Active = selected.Contains(clip.Id);
             checkbox.OnToggled += (_, _) =>
             {
@@ -209,27 +241,48 @@ public sealed partial class PrismWindow
         source.Active = initial.IncludeSource;
         source.OnToggled += (_, _) =>
         { if (session.ExportChoice is { } choice) session.ExportChoice = choice with { IncludeSource = source.Active, Error = null }; };
+        var sourceWords = Column(2);
+        sourceWords.Append(Label(videos > 1 ? $"Main videos ({videos})" : "Main video", "t12", "medium"));
+        sourceWords.Append(Label("The original long video, copied as is.", "muted", "t11"));
+        source.Child = sourceWords;
+        card.Append(Divider());
         card.Append(source);
-        card.Append(Text("The original long video, copied as is.", "muted"));
+        card.Append(Divider());
         var qualities = Enum.GetValues<ExportQuality>();
-        card.Append(Field("Quality", Combo(qualities.Select(quality => quality.Title()), Array.IndexOf(qualities, initial.Quality), index =>
-        { if (index >= 0 && session.ExportChoice is { } choice) session.ExportChoice = choice with { Quality = qualities[index], Error = null }; })));
+        card.Append(Label("Quality", "muted", "medium"));
+        var segments = Gtk.Box.New(Gtk.Orientation.Horizontal, 6);
+        segments.Homogeneous = true;
+        var qualityButtons = new List<Gtk.Button>();
+        foreach (var quality in qualities)
+        {
+            var option = Button(quality.Title(), () => { if (session.ExportChoice is { } choice) session.ExportChoice = choice with { Quality = quality, Error = null }; }, "compact");
+            option.Halign = Gtk.Align.Fill;
+            segments.Append(option); qualityButtons.Add(option);
+        }
+        card.Append(segments);
         var qualityDetail = Text("", "muted");
         card.Append(qualityDetail);
-        var folder = Entry(initial.Folder, "Export folder", text =>
-        { if (session.ExportChoice is { } choice) session.ExportChoice = choice with { Folder = text, Error = null }; });
-        var folderRow = Row();
+        card.Append(Divider());
+        card.Append(Label("Save to", "muted", "medium"));
+        var folderMark = Icon("folder-symbolic", 14);
+        folderMark.AddCssClass("muted");
+        var folder = Label(initial.Folder);
+        folder.Ellipsize = Pango.EllipsizeMode.Middle;
+        folder.Hexpand = true;
+        var folderRow = Row(8);
+        folderRow.AddCssClass("inset");
+        folderRow.Append(folderMark);
         folderRow.Append(folder);
         folderRow.Append(Button("Change…", async () =>
         {
             var picked = await ChooseFolder("Export here");
-            if (picked is not null) folder.SetText(picked);
-        }));
-        card.Append(Field("Save to", folderRow));
+            if (picked is not null && session.ExportChoice is { } choice) session.ExportChoice = choice with { Folder = picked, Error = null };
+        }, "compact"));
+        card.Append(folderRow);
         var error = Text("", "warning");
         card.Append(error);
         var export = Button("Export", async () => { if (session.ExportChoice is { } choice) await session.Export(choice); }, "primary");
-        card.Append(FlowButtons(Button("Cancel", () => session.ExportChoice = null), export));
+        card.Append(Footer(Button("Cancel", () => session.ExportChoice = null), export));
         updateModal = () =>
         {
             if (session.ExportChoice is not { } choice) return;
@@ -239,7 +292,10 @@ public sealed partial class PrismWindow
             export.Label = count == 1 ? "Export 1 file" : $"Export {count} files";
             export.Sensitive = count > 0 && !string.IsNullOrWhiteSpace(choice.Folder);
             all.Label = checks.Values.All(check => check.Active) ? "Select none" : "Select all";
-            all.Sensitive = checks.Count > 0;
+            all.Visible = checks.Count > 0;
+            folder.SetText(choice.Folder); folder.TooltipText = choice.Folder;
+            for (var index = 0; index < qualities.Length; index++)
+                if (qualities[index] == choice.Quality) { qualityButtons[index].AddCssClass("primary"); } else qualityButtons[index].RemoveCssClass("primary");
             qualityDetail.SetText(choice.Quality.Detail() + " Applies to Shorts; the main video keeps its original quality.");
         };
         return card;
@@ -252,7 +308,9 @@ public sealed partial class PrismWindow
     {
         var card = ModalCard(title);
         card.Append(Text(message));
-        card.Append(Button("Close", CloseLocal, "primary"));
+        var close = Button("Close", CloseLocal, "primary");
+        close.Halign = Gtk.Align.End;
+        card.Append(close);
         ShowLocal(card);
     }
 
@@ -269,7 +327,7 @@ public sealed partial class PrismWindow
         }
         entry.OnActivate += (_, _) => Submit();
         card.Append(entry);
-        card.Append(FlowButtons(Button("Cancel", CloseLocal), Button("Save", Submit, "primary")));
+        card.Append(Footer(Button("Cancel", CloseLocal), Button("Save", Submit, "primary")));
         ShowLocal(card);
         entry.GrabFocus();
     }
@@ -278,7 +336,7 @@ public sealed partial class PrismWindow
     {
         var card = ModalCard(title);
         card.Append(Text(message));
-        card.Append(FlowButtons(Button("Cancel", CloseLocal), Button(confirm, () => { CloseLocal(); action(); }, "danger")));
+        card.Append(Footer(Button("Cancel", CloseLocal), Button(confirm, () => { CloseLocal(); action(); }, "danger")));
         ShowLocal(card);
     }
 }

@@ -494,6 +494,8 @@ public sealed partial class AppSession
                 if (sources.Count > 0) parts.Add("the main video");
                 Message = WithModelNote($"Exported {string.Join(" and ", parts)} to {DisplayPath(folder)}.");
                 ExportSummary = Message;
+                // The website keeps the Mac app's quality names: full, compact, small.
+                _ = Account.RecordExport(segments.Count, segments.Sum(item => item.Segment.Duration), choice.Quality.ToString().ToLowerInvariant());
             }).ConfigureAwait(false);
         }
         catch (Exception error)

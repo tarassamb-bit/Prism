@@ -9,6 +9,7 @@ namespace Prism.Linux;
 public sealed class LinuxPlatform : IPlatform
 {
     public IKeyStore KeyStore { get; } = new LinuxKeyStore();
+    public IKeyStore AccountStore { get; } = new LinuxKeyStore("account", "Prism account sign-in");
 
     public string DownloadsFolder
     {
@@ -127,10 +128,10 @@ public sealed class LinuxPlatform : IPlatform
 }
 
 /// <summary>Secret Service first; a private 0600 file when a desktop keyring is unavailable.</summary>
-public sealed class LinuxKeyStore : IKeyStore
+public sealed class LinuxKeyStore(string name = "gemini", string label = "Prism Gemini API key") : IKeyStore
 {
-    string KeyPath => Path.Combine(AppPaths.Config, "gemini.key");
-    static readonly string[] Attributes = ["application", "prism", "provider", "gemini"];
+    string KeyPath => Path.Combine(AppPaths.Config, name + ".key");
+    string[] Attributes => ["application", "prism", "provider", name];
 
     public string Read()
     {
@@ -151,7 +152,7 @@ public sealed class LinuxKeyStore : IKeyStore
             File.Delete(KeyPath);
             return;
         }
-        if (LinuxPlatform.Run("secret-tool", ["store", "--label=Prism Gemini API key", .. Attributes], key + "\n").Code == 0)
+        if (LinuxPlatform.Run("secret-tool", ["store", "--label=" + label, .. Attributes], key + "\n").Code == 0)
         { File.Delete(KeyPath); return; }
         LinuxPlatform.PrivateDirectory(AppPaths.Config);
         var temporary = KeyPath + "." + Guid.NewGuid().ToString("N") + ".tmp";

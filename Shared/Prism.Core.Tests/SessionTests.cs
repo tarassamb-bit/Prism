@@ -23,6 +23,7 @@ public class SessionTests
     {
         public readonly MemoryKeys Keys = new();
         public IKeyStore KeyStore => Keys;
+        public IKeyStore AccountStore { get; } = new MemoryKeys();
         public string DownloadsFolder => Path.Combine(root, "Downloads");
         public readonly List<string> Trashed = [];
         public readonly List<string> Opened = [];

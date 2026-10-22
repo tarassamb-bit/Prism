@@ -12,6 +12,7 @@ namespace Prism.Windows;
 public sealed class WindowsPlatform : IPlatform
 {
     public IKeyStore KeyStore { get; } = new WindowsKeyStore();
+    public IKeyStore AccountStore { get; } = new WindowsKeyStore("account", "Prism.Account");
     static readonly Guid DownloadsId = new("374DE290-123F-4565-9164-39C4925E467B");
 
     public string DownloadsFolder
@@ -86,10 +87,10 @@ public sealed class WindowsPlatform : IPlatform
     [DllImport("shell32.dll")] static extern int SHOpenFolderAndSelectItems(IntPtr folder, uint count, [In] IntPtr[] items, uint flags);
 }
 
-public sealed class WindowsKeyStore : IKeyStore
+public sealed class WindowsKeyStore(string name = "gemini", string entropy = "Prism.Gemini") : IKeyStore
 {
-    static readonly byte[] Entropy = Encoding.UTF8.GetBytes("Prism.Gemini");
-    string KeyPath => Path.Combine(AppPaths.Config, "gemini.key");
+    readonly byte[] Entropy = Encoding.UTF8.GetBytes(entropy);
+    string KeyPath => Path.Combine(AppPaths.Config, name + ".key");
 
     public string Read()
     {

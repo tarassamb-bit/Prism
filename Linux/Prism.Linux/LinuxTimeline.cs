@@ -17,11 +17,11 @@ public sealed class LinuxTimeline : IDisposable
     readonly SynchronizationContext? context;
     readonly Gtk.DrawingArea area = Gtk.DrawingArea.New();
     readonly Gtk.Box container = Gtk.Box.New(Gtk.Orientation.Vertical, 0);
-    readonly Gtk.Button undo = Gtk.Button.NewWithLabel("↶");
-    readonly Gtk.Button audio = Gtk.Button.NewWithLabel("Audio");
+    readonly Gtk.Button undo = Gtk.Button.NewFromIconName("edit-undo-symbolic");
+    readonly Gtk.Button audio = Gtk.Button.NewFromIconName("audio-volume-high-symbolic");
     readonly Gtk.Button add = Gtk.Button.NewWithLabel("Add clip");
-    readonly Gtk.Button generate = Gtk.Button.NewWithLabel("Auto Shorts");
-    readonly Gtk.Button settings = Gtk.Button.NewWithLabel("⚙");
+    readonly Gtk.Button generate = Gtk.Button.NewWithLabel("✦  Auto Shorts");
+    readonly Gtk.Button settings = Gtk.Button.NewFromIconName("emblem-system-symbolic");
     readonly Gtk.Label title = Gtk.Label.New("Source timeline");
     readonly List<ImageSurface> frames = [];
     readonly Dictionary<string, float[]> waveforms = [];
@@ -51,16 +51,18 @@ public sealed class LinuxTimeline : IDisposable
         this.session = session;
         context = SynchronizationContext.Current;
         container.AddCssClass("timeline");
-        var tools = Gtk.Box.New(Gtk.Orientation.Horizontal, 12);
-        tools.MarginStart = tools.MarginEnd = 16;
-        tools.MarginTop = tools.MarginBottom = 8;
+        var tools = Gtk.Box.New(Gtk.Orientation.Horizontal, 6);
+        tools.AddCssClass("timeline-tools");
         undo.TooltipText = "Undo edit · Ctrl+Z";
         audio.TooltipText = "Toggle clip audio";
         settings.TooltipText = "Auto Shorts settings";
         title.Hexpand = true;
         title.Xalign = 0;
-        foreach (var button in new[] { undo, audio, add, generate, settings }) button.AddCssClass("flat");
-        tools.Append(undo); tools.Append(audio); tools.Append(title);
+        foreach (var button in new[] { undo, audio, add, generate, settings }) { button.AddCssClass("link"); button.Valign = Gtk.Align.Center; }
+        foreach (var button in new[] { undo, audio, settings }) button.AddCssClass("icon");
+        title.AddCssClass("t11"); title.AddCssClass("medium");
+        var rule = Gtk.Box.New(Gtk.Orientation.Vertical, 0); rule.AddCssClass("divider"); rule.SetSizeRequest(1, 16); rule.Valign = Gtk.Align.Center; rule.MarginStart = 8; rule.MarginEnd = 8;
+        tools.Append(undo); tools.Append(audio); tools.Append(rule); tools.Append(title);
         tools.Append(add); tools.Append(generate); tools.Append(settings);
         undo.OnClicked += (_, _) => session.UndoFromEditor();
         audio.OnClicked += (_, _) => session.ToggleSelectedAudio();
@@ -104,7 +106,7 @@ public sealed class LinuxTimeline : IDisposable
         title.Label_ = session.ActiveSegment is null ? "Source timeline" : "Short timeline";
         undo.Sensitive = session.CanUndo && !Blocked;
         audio.Sensitive = session.ActiveSegment is not null && !Blocked;
-        audio.Label = session.ActiveSegment?.IsMuted == true ? "Muted" : "Audio";
+        audio.IconName = session.ActiveSegment?.IsMuted == true ? "audio-volume-muted-symbolic" : "audio-volume-high-symbolic";
         add.Sensitive = generate.Sensitive = Media is not null && !Blocked;
         settings.Sensitive = !Blocked;
         var media = Media;
@@ -251,11 +253,22 @@ public sealed class LinuxTimeline : IDisposable
         cr.Restore();
     }
 
+    /// A Mac-style track label: a muted symbol, then the name.
+    void TrackLabel(Context cr, string symbol, string title, double baseline)
+    {
+        cr.Save();
+        Ink(cr, "8A8F98", "5C6068");
+        cr.SelectFontFace(symbol == "Aa" ? "Sora" : "DejaVu Sans", FontSlant.Normal, FontWeight.Normal);
+        cr.SetFontSize(symbol == "Aa" ? 10 : 12); cr.MoveTo(15, baseline); cr.ShowText(symbol);
+        cr.Restore();
+        Text(cr, title, 33, baseline, 64, true);
+    }
+
     void Draw(Context cr, int width, int height)
     {
         plotWidth = Math.Max(1, width - Left - Right);
         Ink(cr, "171920", "FFFFFF"); cr.Paint();
-        Ink(cr, "0E0F14", "EDE9E0"); cr.Rectangle(0, 0, 100, height); cr.Fill();
+        Ink(cr, "20232B", "EDE9E0"); cr.Rectangle(0, 0, 100, height); cr.Fill();
         var length = Length;
         for (var index = 0; index <= 6; index++)
         {
@@ -263,10 +276,10 @@ public sealed class LinuxTimeline : IDisposable
             Ink(cr, "2C2F37", "E2DED4", 0.7); cr.LineWidth = 1; cr.MoveTo(x, 24); cr.LineTo(x, AudioY + AudioHeight); cr.Stroke();
             Text(cr, Format.Clock(length * index / 6), x - (index == 6 ? 39 : 0), 18, 50, true, true);
         }
-        Text(cr, "Video", 16, VideoY + 34, 80, true);
-        Text(cr, "Focus L↕R", 16, FocusY + 18, 80, true);
-        Text(cr, "Text", 16, TextY + 20, 80, true);
-        Text(cr, "Audio", 16, AudioY + 22, 80, true);
+        TrackLabel(cr, "▣", "Video", VideoY + 34);
+        TrackLabel(cr, "◎", "Focus L↕R", FocusY + 18);
+        TrackLabel(cr, "Aa", "Text", TextY + 20);
+        TrackLabel(cr, "∿", "Audio", AudioY + 22);
         DrawVideo(cr, length);
         DrawFocus(cr, length);
         DrawText(cr, length);
@@ -280,8 +293,8 @@ public sealed class LinuxTimeline : IDisposable
 
     void DrawVideo(Context cr, double length)
     {
-        Ink(cr, "20232B", "EDE9E0"); Rounded(cr, Left, VideoY, plotWidth, VideoHeight, 7); cr.Fill();
-        cr.Save(); Rounded(cr, Left, VideoY, plotWidth, VideoHeight, 7); cr.Clip();
+        Ink(cr, "20232B", "EDE9E0"); Rounded(cr, Left, VideoY, plotWidth, VideoHeight, 8); cr.Fill();
+        cr.Save(); Rounded(cr, Left, VideoY, plotWidth, VideoHeight, 8); cr.Clip();
         for (var index = 0; index < frames.Count; index++)
         {
             var image = frames[index]; var cell = plotWidth / frames.Count;
@@ -303,13 +316,18 @@ public sealed class LinuxTimeline : IDisposable
         }
         if (Media is { } source)
         {
-            cr.SetSourceRgba(0, 0, 0, 0.55); Rounded(cr, Left + 6, VideoY + 6, Math.Max(1, Math.Min(plotWidth - 12, 240)), 20, 3); cr.Fill();
-            cr.SetSourceRgb(0.965, 0.953, 0.925); cr.SelectFontFace("Sora", FontSlant.Normal, FontWeight.Normal);
-            cr.SetFontSize(10); cr.MoveTo(Left + 11, VideoY + 20); cr.ShowText(source.Name);
+            // The source badge is as wide as the name, with light text on its dark backing.
+            cr.SelectFontFace("Sora", FontSlant.Normal, FontWeight.Bold);
+            cr.SetFontSize(11);
+            var badge = Math.Max(1, Math.Min(plotWidth - 12, source.Name.Length * 6.6 + 12));
+            cr.SetSourceRgba(0, 0, 0, 0.55); Rounded(cr, Left + 6, VideoY + 6, badge, 22, 3); cr.Fill();
+            cr.Save(); cr.Rectangle(Left + 6, VideoY + 6, badge, 22); cr.Clip();
+            cr.SetSourceRgb(0.965, 0.953, 0.925); cr.MoveTo(Left + 12, VideoY + 21); cr.ShowText(source.Name);
+            cr.Restore();
         }
         else Text(cr, "Add a video to start your timeline", Left + 12, VideoY + 34, plotWidth - 24, true);
         cr.Restore();
-        if (session.ActiveSegment is not null) { Ink(cr, "3FA9F5", "0B6CB5"); cr.LineWidth = 2; Rounded(cr, Left, VideoY, plotWidth, VideoHeight, 7); cr.Stroke(); }
+        if (session.ActiveSegment is not null) { Ink(cr, "3FA9F5", "0B6CB5"); cr.LineWidth = 2; Rounded(cr, Left, VideoY, plotWidth, VideoHeight, 8); cr.Stroke(); }
     }
 
     void DrawFocus(Context cr, double length)
@@ -323,7 +341,7 @@ public sealed class LinuxTimeline : IDisposable
         double Y(double value) => FocusY + 3 + (1 - Math.Clamp(value + offset, 0, 1)) * (FocusHeight - 6);
         if (points.Count > 0)
         {
-            Ink(cr, "3FA9F5", "0B6CB5"); cr.LineWidth = 2;
+            Ink(cr, "3FA9F5", "0B6CB5"); cr.LineWidth = 2; cr.LineCap = LineCap.Round; cr.LineJoin = LineJoin.Round;
             if (points.Count == 1) { cr.MoveTo(Left, Y(points[0].Position)); cr.LineTo(Left + plotWidth, Y(points[0].Position)); }
             else for (var index = 0; index < points.Count; index++)
             {
@@ -349,7 +367,8 @@ public sealed class LinuxTimeline : IDisposable
 
     void DrawText(Context cr, double length)
     {
-        Ink(cr, "0E0F14", "EDE9E0"); Rounded(cr, Left, TextY, plotWidth, TextHeight); cr.Fill();
+        Ink(cr, "171920", "FFFFFF"); Rounded(cr, Left + 0.5, TextY + 0.5, plotWidth - 1, TextHeight - 1); cr.FillPreserve();
+        Ink(cr, "2C2F37", "E2DED4"); cr.LineWidth = 1; cr.Stroke();
         if (session.ActiveSegment is not { } clip) { Text(cr, "Select a Short to edit text and subtitles", Left + 10, TextY + 20, plotWidth - 20, true); return; }
         if (!string.IsNullOrWhiteSpace(clip.Caption))
         {

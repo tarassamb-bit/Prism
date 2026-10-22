@@ -27,6 +27,8 @@ public sealed partial class AppSession : INotifyPropertyChanged, IDisposable
     readonly SynchronizationContext? context;
     readonly IPlatform platform;
     public AppSettings Settings { get; }
+    /// <summary>The optional Prism account that counts exports on the website.</summary>
+    public Account Account { get; }
 
     public AppSession(IPlatform platform, AppSettings? settings = null)
     {
@@ -36,6 +38,8 @@ public sealed partial class AppSession : INotifyPropertyChanged, IDisposable
         isGeminiKeySaved = Settings.GeminiKeySaved;
         geminiKeyStatus = isGeminiKeySaved ? "Your API key is saved securely. For security, the saved value stays hidden." : "";
         geminiModel = Settings.GeminiModel;
+        Account = new Account(platform.AccountStore);
+        Account.PropertyChanged += (_, _) => Post(() => Changed(nameof(Account)));
         Directory.CreateDirectory(AppPaths.Projects);
         RestoreSavedProjects();
     }
