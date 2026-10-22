@@ -1,5 +1,7 @@
+using System.Globalization;
 using System.IO;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
@@ -11,91 +13,185 @@ public sealed partial class PrismWindow
 {
     UIElement Home()
     {
-        var page = Column(); page.Margin = new Thickness(30);
-        var start = Card(Text("One in. Many out.", 32, display: true), Text("Choose a video and Prism finds the moments worth sharing."), Button("Create Shorts", StartCreate));
-        start.Background = new SolidColorBrush(Color.FromRgb(63, 169, 245));
-        foreach (var label in ((StackPanel)start.Child).Children.OfType<TextBlock>()) label.Foreground = new SolidColorBrush(Color.FromRgb(14, 15, 20));
-        page.Children.Add(start);
-        page.Children.Add(SplitRow(Text("Folders", 20, display: true), Row(
-            Button("New folder", () => Prompt("New folder", "Folder name", "", name => { session.CreateFolder(name); InvalidateScreen(); })),
-            Button("Open project…", () => { if (ChooseFolder("Open a Prism project (.relio)") is { } path) session.Open(path); }))));
-        var folders = new WrapPanel { Margin = new Thickness(0, 8, 0, 18) };
-        var all = Button("Projects", () => { openFolder = null; InvalidateScreen(); });
-        AcceptProjectDrop(all, null); folders.Children.Add(all);
-        foreach (var folder in session.ProjectFolders)
-        {
-            var button = Button($"▣  {folder.Name} ({folder.ProjectPaths.Count})", () => { openFolder = folder.Id; InvalidateScreen(); });
-            if (openFolder == folder.Id) button.SetResourceReference(Control.BorderBrushProperty, "Accent");
-            button.ContextMenu = Menu(
-                ("Rename", () => Prompt("Rename folder", "Folder name", folder.Name, name => { session.RenameFolder(folder.Id, name); InvalidateScreen(); })),
-                ("Remove folder", () => Confirm("Remove folder?", "Projects in this folder will go back to Home.", "Remove folder", () => { session.DeleteFolder(folder.Id); openFolder = null; InvalidateScreen(); })));
-            AcceptProjectDrop(button, folder.Id); folders.Children.Add(button);
-        }
-        page.Children.Add(folders);
-        var paths = session.RecentProjectPaths.Where(path => openFolder is null
-            ? !session.ProjectFolders.Any(folder => folder.ProjectPaths.Contains(path))
-            : session.ProjectFolders.FirstOrDefault(folder => folder.Id == openFolder)?.ProjectPaths.Contains(path) == true).ToList();
+        var page = Column(); page.Margin = new Thickness(24); page.MaxWidth = 1800;
+        page.Children.Add(StartCreatingButton());
+
+        // Uploads that never got Shorts are kept but tucked away.
+        var folder = session.ProjectFolders.FirstOrDefault(item => item.Id == openFolder);
+        var paths = session.RecentProjectPaths.Where(path => folder is null
+            ? !session.ProjectFolders.Any(item => item.ProjectPaths.Contains(path))
+            : folder.ProjectPaths.Contains(path)).ToList();
         var counts = ProjectInfo.ShortCounts(paths);
         var finished = paths.Where(path => counts.GetValueOrDefault(path) > 0).ToList();
         var unfinished = paths.Where(path => counts.GetValueOrDefault(path) == 0).ToList();
-        var title = Text(openFolder is { } id ? session.ProjectFolders.FirstOrDefault(folder => folder.Id == id)?.Name ?? "Projects" : "Your projects", 20, display: true);
-        page.Children.Add(SplitRow(title, finished.Count > 6 ? Button(showAll ? "Show fewer" : "Show all", () => { showAll = !showAll; InvalidateScreen(); }) : new Border()));
-        if (finished.Count == 0) page.Children.Add(Text("Your finished Shorts projects will appear here.", muted: true));
-        else
+
+        var title = Row();
+        if (folder is not null)
         {
-            var grid = new WrapPanel();
-            foreach (var path in finished.Take(showAll ? int.MaxValue : 6)) grid.Children.Add(ProjectTile(path, counts.GetValueOrDefault(path)));
-            page.Children.Add(grid);
+            var back = Ghost(Button("Projects", () => { openFolder = null; InvalidateScreen(); }, icon: ""));
+            back.ToolTip = "Back to all projects · drop a project here to take it out of the folder";
+            AcceptProjectDrop(back, null); title.Children.Add(back);
+            title.Children.Add(Text(folder.Name, 22, display: true));
         }
+        else title.Children.Add(Text("Projects", 22, display: true));
+        var actions = Row();
+        if (folder is null)
+        {
+            var add = Ghost(Button("New folder", () => Prompt("New folder", "Folder name", "", name => { session.CreateFolder(name); InvalidateScreen(); }), icon: ""));
+            add.ToolTip = "Make a folder and drag projects into it"; actions.Children.Add(add);
+        }
+        actions.Children.Add(Ghost(Button("Open project…", () => { if (ChooseFolder("Open a Prism project (.relio)") is { } path) session.Open(path); }, icon: "")));
         if (unfinished.Count > 0)
         {
-            page.Children.Add(Button($"{(showUnfinished ? "▾" : "▸")} Unfinished projects ({unfinished.Count})", () => { showUnfinished = !showUnfinished; InvalidateScreen(); }));
-            if (showUnfinished)
+            var toggle = Ghost(Button("", () => { showUnfinished = !showUnfinished; InvalidateScreen(); }));
+            toggle.Content = Disclosure(showUnfinished ? "Hide unfinished" : $"Show {unfinished.Count} unfinished", showUnfinished);
+            toggle.ToolTip = "Projects where a video was uploaded but no Shorts were made"; actions.Children.Add(toggle);
+        }
+        var header = SplitRow(title, actions); header.Margin = new Thickness(0, 30, 0, 14);
+        page.Children.Add(header);
+
+        if (folder is null && session.ProjectFolders.Count > 0)
+        {
+            var folders = AdaptiveGrid(160, session.ProjectFolders.Select(FolderTile)); folders.Margin = new Thickness(0, 0, 0, 18);
+            page.Children.Add(folders);
+        }
+        if (folder is not null && paths.Count == 0)
+            page.Children.Add(EmptyState("", $"{folder.Name} is empty", "Go back to Projects and drag a project onto this folder, or right-click a project › Move to folder."));
+        else if (session.RecentProjectPaths.Count == 0)
+            page.Children.Add(EmptyState("", "Your projects will appear here", "Create a Short to start your first project."));
+        else
+        {
+            // Newest first; two rows keep Home calm, the rest are one click away.
+            page.Children.Add(AdaptiveGrid(160, finished.Take(showAll ? int.MaxValue : 12).Select(path => ProjectTile(path, counts.GetValueOrDefault(path)))));
+            if (finished.Count > 12)
             {
-                var grid = new WrapPanel();
-                foreach (var path in unfinished) grid.Children.Add(ProjectTile(path, 0));
+                var more = Button("", () => { showAll = !showAll; InvalidateScreen(); });
+                more.Content = Disclosure(showAll ? "Show fewer" : $"Show all {finished.Count} projects", showAll); more.HorizontalAlignment = HorizontalAlignment.Left;
+                page.Children.Add(more);
+            }
+            if (showUnfinished && unfinished.Count > 0)
+            {
+                var heading = Text("Unfinished", 18, display: true); heading.Margin = new Thickness(0, 16, 0, 0);
+                page.Children.Add(heading);
+                page.Children.Add(Text("A video was uploaded, but no Shorts were made yet.", 12, muted: true));
+                var grid = AdaptiveGrid(160, unfinished.Select(path => ProjectTile(path, 0))); grid.Margin = new Thickness(0, 8, 0, 0);
                 page.Children.Add(grid);
             }
         }
         return Scroll(page);
     }
 
+    Button StartCreatingButton()
+    {
+        var hero = Button("", StartCreate);
+        hero.SetResourceReference(StyleProperty, "Hero"); hero.SetResourceReference(BackgroundProperty, "Action");
+        hero.Foreground = OnAction; hero.BorderThickness = new Thickness(0); hero.MinHeight = 104; hero.Padding = new Thickness(24, 18, 24, 18); hero.Margin = new Thickness(0);
+        hero.ToolTip = "Start creating · Ctrl+N"; hero.HorizontalAlignment = HorizontalAlignment.Stretch; AutomationProperties.SetName(hero, "Start creating");
+        var body = new Grid();
+        foreach (var width in new[] { GridLength.Auto, new GridLength(1, GridUnitType.Star), GridLength.Auto }) body.ColumnDefinitions.Add(new ColumnDefinition { Width = width });
+        var plus = Glyph("", 26); plus.Margin = new Thickness(0, 0, 20, 0); body.Children.Add(plus);
+        var title = Label("Start creating", 22); title.SetResourceReference(TextBlock.FontFamilyProperty, "DisplayFont");
+        var detail = Label("One in. Many out. Choose a video and Prism finds the moments worth sharing.", 13);
+        detail.Opacity = 0.82; detail.TextWrapping = TextWrapping.Wrap; detail.Margin = new Thickness(0, 5, 0, 0);
+        var words = Column(title, detail); words.VerticalAlignment = VerticalAlignment.Center; Grid.SetColumn(words, 1); body.Children.Add(words);
+        var arrow = Glyph("", 18); arrow.Margin = new Thickness(12, 0, 0, 0); Grid.SetColumn(arrow, 2); body.Children.Add(arrow);
+        hero.Content = body;
+        return hero;
+    }
+
+    static StackPanel Disclosure(string title, bool open)
+    {
+        var chevron = Glyph(open ? "" : "", 10); chevron.Margin = new Thickness(6, 0, 0, 0);
+        return Row(Label(title), chevron);
+    }
+
+    static Border EmptyState(string glyph, string title, string detail)
+    {
+        var heading = Text(title, 14); heading.FontWeight = FontWeights.Medium; heading.HorizontalAlignment = HorizontalAlignment.Center;
+        var note = Text(detail, muted: true); note.TextAlignment = TextAlignment.Center; note.HorizontalAlignment = HorizontalAlignment.Center;
+        var mark = Glyph(glyph, 34, "Muted"); mark.Margin = new Thickness(0, 0, 0, 6);
+        return Surface(Column(mark, heading, note), padding: 48);
+    }
+
+    UIElement FolderTile(ProjectFolder folder)
+    {
+        var count = folder.ProjectPaths.Count(path => session.RecentProjectPaths.Contains(path));
+        var tile = Button("", () => { openFolder = folder.Id; InvalidateScreen(); });
+        tile.SetResourceReference(StyleProperty, "Tile"); tile.SetResourceReference(BackgroundProperty, "Surface1");
+        tile.BorderBrush = Brushes.Transparent; tile.BorderThickness = new Thickness(2); tile.HorizontalAlignment = HorizontalAlignment.Stretch; tile.Padding = new Thickness(14); tile.MinHeight = 64;
+        var mark = Glyph("", 26, "Accent"); mark.Margin = new Thickness(0, 0, 12, 0);
+        var name = Text(folder.Name, 13); name.FontWeight = FontWeights.Medium; name.TextWrapping = TextWrapping.NoWrap; name.TextTrimming = TextTrimming.CharacterEllipsis; name.Margin = new Thickness(0, 0, 0, 3);
+        var detail = Text(count == 1 ? "1 project" : $"{count} projects", 11, muted: true); detail.Margin = new Thickness(0);
+        var words = Column(name, detail); words.VerticalAlignment = VerticalAlignment.Center;
+        var body = new DockPanel(); DockPanel.SetDock(mark, Dock.Left); body.Children.Add(mark); body.Children.Add(words);
+        tile.Content = body; tile.ToolTip = "Open folder · drop projects here";
+        AutomationProperties.SetName(tile, $"Folder {folder.Name}, {count} projects");
+        tile.ContextMenu = Menu(
+            ("Rename…", () => Prompt("Rename folder", "Folder name", folder.Name, name => { session.RenameFolder(folder.Id, name); InvalidateScreen(); })),
+            ("Delete folder (keeps projects)", () => { session.DeleteFolder(folder.Id); openFolder = null; InvalidateScreen(); }));
+        AcceptProjectDrop(tile, folder.Id);
+        return tile;
+    }
+
     UIElement ProjectTile(string path, int count)
     {
         var project = ProjectStore.ReadProject(path);
         var name = project?.DisplayTitle ?? Path.GetFileNameWithoutExtension(path);
-        var poster = new ContentControl { Width = 218, Height = 130, Content = Text("◩", 40, display: true) };
-        var title = Text(name); title.MaxHeight = 46; title.TextTrimming = TextTrimming.CharacterEllipsis;
-        var details = Text($"{count} {(count == 1 ? "Short" : "Shorts")} · {project?.Created.ToLocalTime():d}", 11, muted: true);
+        var poster = new Grid { ClipToBounds = true };
+        poster.SetResourceReference(Panel.BackgroundProperty, "Surface2");
+        poster.Children.Add(Glyph("", 30, "Muted"));
+        poster.SizeChanged += (_, args) =>
+        {
+            if (args.WidthChanged) poster.Height = args.NewSize.Width * 9 / 16;
+            poster.Clip = new RectangleGeometry(new Rect(args.NewSize), 12, 12);
+        };
+        var clock = Text("", 10, display: true); clock.Margin = new Thickness(0); clock.Foreground = Frozen(Color.FromRgb(246, 243, 236));
+        var badge = new Border { Child = clock, Background = Frozen(Color.FromArgb(199, 0, 0, 0)), CornerRadius = new CornerRadius(8), Padding = new Thickness(6, 3, 6, 3), Margin = new Thickness(6),
+            HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Bottom, Visibility = Visibility.Collapsed };
+        poster.Children.Add(badge);
+        var title = Text(name, 12); title.FontWeight = FontWeights.Medium; title.MinHeight = 30; title.MaxHeight = 34; title.TextTrimming = TextTrimming.CharacterEllipsis; title.Margin = new Thickness(0, 9, 0, 4);
+        var details = Text(Details(count, project?.Created), 9, muted: true); details.FontWeight = FontWeights.Medium; details.TextWrapping = TextWrapping.NoWrap; details.Margin = new Thickness(0);
         var open = Button("", () => session.Open(path));
-        open.Content = Column(poster, title, details); open.BorderThickness = new Thickness(0); open.Background = Brushes.Transparent;
-        open.Padding = new Thickness(0); open.Margin = new Thickness(0);
-        var duration = Text(project?.Media.FirstOrDefault(media => media.Kind == "video") is { } video ? Format.Clock(video.Duration) : "", 11, muted: true, mono: true);
-        var card = Card(open, duration); card.Width = 258; card.Margin = new Thickness(0, 8, 14, 8);
+        open.SetResourceReference(StyleProperty, "Tile"); open.SetResourceReference(BackgroundProperty, "Surface1");
+        open.BorderThickness = new Thickness(0); open.Padding = new Thickness(8); open.Margin = new Thickness(0); open.HorizontalAlignment = HorizontalAlignment.Stretch;
+        open.Content = Column(poster, title, details);
+        AutomationProperties.SetName(open, $"Open {name}");
         var actions = new List<(string, Action)>
         {
-            ("Rename", () => Prompt("Rename project", "Project title", name, value => { session.RenameProject(path, value); InvalidateScreen(); })),
-            ("Move to folder…", () => MoveProjectCard(path)), ("Stats", () => ShowStats(path)),
-            ("Move to Recycle Bin", () => Confirm("Move project to Recycle Bin?", $"“{name}” will be moved to the Recycle Bin, where it can still be restored.", "Move to Recycle Bin", () => { session.DeleteProject(path); InvalidateScreen(); })),
+            ("Rename…", () => Prompt("Rename project", "Project name", name, value => { session.RenameProject(path, value); InvalidateScreen(); })),
+            ("Move to folder…", () => MoveProjectCard(path)), ("Show stats", () => ShowStats(path)),
+            ("Move to Recycle Bin", () => Confirm("Move this project to the Recycle Bin?", "Its Shorts, exports and imported video go to the Recycle Bin. You can restore the project from there.", "Move to Recycle Bin", () => { session.DeleteProject(path); InvalidateScreen(); })),
         };
         if (session.ProjectFolders.Any(folder => folder.ProjectPaths.Contains(path))) actions.Insert(2, ("Remove from folder", () => { session.MoveProject(path, null); InvalidateScreen(); }));
-        card.ContextMenu = Menu(actions.ToArray());
-        var menu = Button("⋮", () => { card.ContextMenu.PlacementTarget = card; card.ContextMenu.IsOpen = true; });
-        ((StackPanel)card.Child).Children.Add(menu);
+        open.ContextMenu = Menu(actions.ToArray());
+        var host = new Border { Child = open };
         Point down = default;
-        card.PreviewMouseLeftButtonDown += (_, args) => down = args.GetPosition(card);
-        card.PreviewMouseMove += (_, args) =>
+        host.PreviewMouseLeftButtonDown += (_, args) => down = args.GetPosition(host);
+        host.PreviewMouseMove += (_, args) =>
         {
             if (args.LeftButton != MouseButtonState.Pressed || session.IsBusy) return;
-            var here = args.GetPosition(card);
+            var here = args.GetPosition(host);
             if (Math.Abs(here.X - down.X) < SystemParameters.MinimumHorizontalDragDistance && Math.Abs(here.Y - down.Y) < SystemParameters.MinimumVerticalDragDistance) return;
-            DragDrop.DoDragDrop(card, new DataObject("PrismProject", path), DragDropEffects.Move);
+            open.ReleaseMouseCapture();
+            DragDrop.DoDragDrop(host, new DataObject("PrismProject", path), DragDropEffects.Move);
         };
-        _ = LoadPoster(path, poster, title, details);
-        return card;
+        _ = LoadPoster(path, poster, badge, clock, title, details);
+        return host;
     }
 
-    async Task LoadPoster(string path, ContentControl picture, TextBlock title, TextBlock details)
+    static string Details(int shorts, DateTime? created)
+    {
+        var count = shorts == 0 ? "No Shorts yet" : shorts == 1 ? "1 Short" : $"{shorts} Shorts";
+        return created is { } date ? count + " · " + date.ToLocalTime().ToString("d MMM, HH:mm", CultureInfo.CurrentCulture) : count;
+    }
+
+    static string ShortClock(double seconds)
+    {
+        var total = Math.Max(0, (int)Math.Round(seconds));
+        return total >= 3600 ? $"{total / 3600}:{total / 60 % 60:00}:{total % 60:00}" : $"{total / 60}:{total % 60:00}";
+    }
+
+    async Task LoadPoster(string path, Grid picture, Border badge, TextBlock clock, TextBlock title, TextBlock details)
     {
         var revision = homeRevision;
         try
@@ -103,8 +199,9 @@ public sealed partial class PrismWindow
             var summary = summaries.GetValueOrDefault(path) ?? await Task.Run(() => ProjectInfo.Summary(path));
             if (disposed || revision != homeRevision) return;
             summaries[path] = summary; title.Text = summary.Title;
-            details.Text = $"{summary.ShortCount} {(summary.ShortCount == 1 ? "Short" : "Shorts")} · {summary.Created?.ToLocalTime():d}";
-            if (summary.Poster is not null) picture.Content = Picture(summary.Poster, 218, 130);
+            details.Text = Details(summary.ShortCount, summary.Created);
+            if (summary.Duration is { } duration) { clock.Text = ShortClock(duration); badge.Visibility = Visibility.Visible; }
+            if (summary.Poster is not null) picture.Children.Insert(1, Picture(summary.Poster, double.NaN, double.NaN));
         }
         catch (Exception) { }
     }
@@ -121,12 +218,21 @@ public sealed partial class PrismWindow
         return menu;
     }
 
-    void AcceptProjectDrop(FrameworkElement widget, Guid? folderId)
+    void AcceptProjectDrop(Control widget, Guid? folderId)
     {
         widget.AllowDrop = true;
+        Brush? background = null, outline = null;
+        void Highlight(bool on)
+        {
+            if (on && background is null) { background = widget.Background; outline = widget.BorderBrush; widget.SetResourceReference(BackgroundProperty, "AccentWash"); widget.SetResourceReference(BorderBrushProperty, "Accent"); }
+            else if (!on && background is not null) { widget.Background = background; widget.BorderBrush = outline; background = outline = null; }
+        }
+        widget.DragEnter += (_, args) => Highlight(!session.IsBusy && args.Data.GetDataPresent("PrismProject"));
+        widget.DragLeave += (_, _) => Highlight(false);
         widget.DragOver += (_, args) => { args.Effects = !session.IsBusy && args.Data.GetDataPresent("PrismProject") ? DragDropEffects.Move : DragDropEffects.None; args.Handled = true; };
         widget.Drop += (_, args) =>
         {
+            Highlight(false);
             if (session.IsBusy || args.Data.GetData("PrismProject") is not string path || !session.RecentProjectPaths.Contains(path)) return;
             session.MoveProject(path, folderId); InvalidateScreen(); args.Handled = true;
         };
@@ -135,20 +241,40 @@ public sealed partial class PrismWindow
     void MoveProjectCard(string path)
     {
         var card = ModalCard("Move to folder"); var body = (StackPanel)card.Child;
-        foreach (var folder in session.ProjectFolders) body.Children.Add(Button(folder.Name, () => { session.MoveProject(path, folder.Id); CloseLocal(); InvalidateScreen(); }));
-        body.Children.Add(Button("New folder…", () => Prompt("New folder", "Folder name", "", name =>
-        { if (session.CreateFolder(name) is { } id) session.MoveProject(path, id); InvalidateScreen(); })));
-        body.Children.Add(Button("Cancel", CloseLocal)); ShowLocal(card);
+        foreach (var folder in session.ProjectFolders.Where(folder => !folder.ProjectPaths.Contains(path)))
+        {
+            var choice = Button(folder.Name, () => { session.MoveProject(path, folder.Id); CloseLocal(); InvalidateScreen(); }, icon: "");
+            choice.HorizontalContentAlignment = HorizontalAlignment.Left; choice.HorizontalAlignment = HorizontalAlignment.Stretch; body.Children.Add(choice);
+        }
+        body.Children.Add(Ghost(Button("New folder…", () => Prompt("New folder", "Folder name", "", name =>
+        { if (session.CreateFolder(name) is { } id) session.MoveProject(path, id); InvalidateScreen(); }), icon: "")));
+        var cancel = Button("Cancel", CloseLocal); cancel.HorizontalAlignment = HorizontalAlignment.Right;
+        body.Children.Add(cancel); ShowLocal(card);
     }
 
     void ShowStats(string path)
     {
-        if (ProjectInfo.Stats(path) is not { } stats) { ShowNotice("Project stats", "This project could not be read."); return; }
-        var card = ModalCard("Project stats"); var body = (StackPanel)card.Child;
-        body.Children.Add(Text(stats.Title, 20, display: true)); body.Children.Add(Text($"Created {stats.Created.ToLocalTime():f}", muted: true));
-        body.Children.Add(Text($"{stats.ShortCount} Shorts · {Format.Clock(stats.ShortsSeconds)} total · {stats.ExportCount} exports"));
-        if (stats.SourceName is not null) body.Children.Add(Text($"Source: {stats.SourceName}\n{Format.Clock(stats.SourceSeconds ?? 0)} · {stats.Resolution}", muted: true));
-        body.Children.Add(Text($"Library size: {Format.Bytes(stats.Bytes)}", 11, muted: true, mono: true));
-        body.Children.Add(Button("Done", CloseLocal, true)); ShowLocal(card);
+        if (ProjectInfo.Stats(path) is not { } stats) { ShowNotice("Project stats", "Could not read this project."); return; }
+        var card = ModalCard(stats.Title); var body = (StackPanel)card.Child;
+        var grid = new Grid { Margin = new Thickness(0, 8, 0, 8) };
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); grid.ColumnDefinitions.Add(new ColumnDefinition());
+        void Line(string label, string value, bool mono = false)
+        {
+            var row = grid.RowDefinitions.Count; grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            var name = Text(label, muted: true); name.Margin = new Thickness(0, 5, 24, 5); Grid.SetRow(name, row); grid.Children.Add(name);
+            var text = Text(value, mono: mono); text.FontWeight = mono ? FontWeights.Normal : FontWeights.Medium; text.TextWrapping = TextWrapping.NoWrap; text.TextTrimming = TextTrimming.CharacterEllipsis;
+            Grid.SetRow(text, row); Grid.SetColumn(text, 1); grid.Children.Add(text);
+        }
+        Line("Shorts", $"{stats.ShortCount}");
+        Line("Total length of Shorts", ShortClock(stats.ShortsSeconds), true);
+        Line("Exported videos", $"{stats.ExportCount}");
+        if (stats.SourceName is not null) Line("Source video", stats.SourceName);
+        if (stats.SourceSeconds is { } seconds) Line("Source length", ShortClock(seconds), true);
+        if (!string.IsNullOrEmpty(stats.Resolution)) Line("Resolution", stats.Resolution);
+        Line("Created", stats.Created.ToLocalTime().ToString("g", CultureInfo.CurrentCulture));
+        Line("Size on disk", Format.Bytes(stats.Bytes));
+        body.Children.Add(grid);
+        body.Children.Add(SplitRow(Button("Show in Explorer", () => WindowsPlatform.OpenExternal(path)), Button("Done", CloseLocal, true)));
+        ShowLocal(card);
     }
 }

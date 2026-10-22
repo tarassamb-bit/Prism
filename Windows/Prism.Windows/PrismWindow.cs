@@ -2,37 +2,46 @@ using System.ComponentModel;
 using System.Globalization;
 using System.IO;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Shapes;
 using System.Windows.Threading;
 using Prism.Core;
+using Path = System.IO.Path;
 
 namespace Prism.Windows;
 
 public sealed partial class PrismWindow : Window
 {
+    /// Ink text on the Sky action fill, in both themes.
+    internal static readonly SolidColorBrush OnAction = Frozen(Color.FromRgb(14, 15, 20));
+    const string IconFont = "Segoe Fluent Icons, Segoe MDL2 Assets";
+
     readonly AppSession session;
     readonly WindowsEditor editor;
     readonly Grid layout = new();
     readonly Grid overlayHost = new();
-    readonly StackPanel navigation = new() { Margin = new Thickness(20, 24, 20, 18) };
+    readonly DockPanel navigation = new() { LastChildFill = false };
     readonly ContentControl content = new();
     readonly Border sidePanel;
-    readonly TextBlock heading = Text("Home", 20, display: true);
-    readonly TextBlock status = Text("", muted: true);
-    readonly TextBlock memory = Text("", 11, muted: true, mono: true);
-    readonly TextBlock storage = Text("", 11, muted: true, mono: true);
-    readonly ProgressBar memoryBar = new() { Height = 5, Maximum = 1 };
-    readonly ProgressBar storageBar = new() { Height = 5, Maximum = 1 };
+    readonly Border top = new() { Padding = new Thickness(20, 16, 20, 16) };
+    readonly TextBlock heading = Text("Home", 18, display: true);
+    readonly TextBlock status = Text("", 12, muted: true);
+    readonly ProgressBar busy = new() { IsIndeterminate = true, Width = 44, Height = 4, Margin = new Thickness(12, 0, 0, 0) };
+    TextBlock memory = new(), storage = new(), ringLabel = new();
+    ProgressBar memoryBar = new(), storageBar = new();
+    System.Windows.Shapes.Path? ring;
     readonly Dictionary<Screen, Button> navButtons = [];
+    readonly List<Action> appearanceUpdates = [];
     readonly DispatcherTimer resourceTimer = new();
     readonly DispatcherTimer activityTimer = new();
     readonly Dictionary<string, ProjectSummary> summaries = [];
-    string renderedScreen = "", modalKind = "", lastMessage = "";
-    bool queued, disposed, showAll, showUnfinished;
-    int createStep, localRevision;
+    string renderedScreen = "", renderedPage = "", modalKind = "", lastMessage = "";
+    bool queued, disposed, showAll, showUnfinished, sidebarCollapsed;
+    int createStep, localRevision, settingsCategory;
     long homeRevision;
     Guid? openFolder;
     Border? localCard;
@@ -41,9 +50,13 @@ public sealed partial class PrismWindow : Window
     public PrismWindow()
     {
         Title = "Prism";
+        var icon = Path.Combine(AppContext.BaseDirectory, "Brand", "Prism.png");
+        if (File.Exists(icon)) Icon = BitmapFrame.Create(new Uri(icon));
         Width = 1440; Height = 920;
         MinWidth = 900; MinHeight = 620;
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
+        UseLayoutRounding = true; SnapsToDevicePixels = true;
+        SourceInitialized += (_, _) => TintTitleBar();
         session = new AppSession(new WindowsPlatform());
         session.RefreshGeminiKeyState();
         InstallStyles();
@@ -58,37 +71,36 @@ public sealed partial class PrismWindow : Window
         root.Children.Add(overlayHost);
         overlayHost.Visibility = Visibility.Collapsed;
         Content = root;
-        layout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(238) });
+        layout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(252) });
         layout.ColumnDefinitions.Add(new ColumnDefinition());
-        BuildSidebar();
         sidePanel = new Border { Child = navigation, BorderThickness = new Thickness(0, 0, 1, 0) };
         sidePanel.SetResourceReference(Border.BackgroundProperty, "Surface1");
         sidePanel.SetResourceReference(Border.BorderBrushProperty, "Line");
+        BuildSidebar();
         layout.Children.Add(sidePanel);
         var main = new Grid();
         main.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         main.RowDefinitions.Add(new RowDefinition());
         Grid.SetColumn(main, 1);
         layout.Children.Add(main);
-        var header = new DockPanel { Margin = new Thickness(20, 12, 20, 12), LastChildFill = true };
-        var theme = Button("☀ / ☾", () =>
-        {
-            session.Settings.Appearance = session.Settings.Appearance == "light" ? "dark" : "light";
-            session.Settings.Save(); ApplyTheme();
-        });
-        DockPanel.SetDock(theme, Dock.Right); header.Children.Add(theme);
-        DockPanel.SetDock(heading, Dock.Left); heading.Margin = new Thickness(0, 6, 20, 0); header.Children.Add(heading);
-        status.TextTrimming = TextTrimming.CharacterEllipsis;
-        status.TextWrapping = TextWrapping.NoWrap;
-        status.VerticalAlignment = VerticalAlignment.Center;
-        header.Children.Add(status);
-        var top = new Border { Child = header, BorderThickness = new Thickness(0, 0, 0, 1) };
-        top.SetResourceReference(Border.BackgroundProperty, "Surface1");
-        top.SetResourceReference(Border.BorderBrushProperty, "Line");
+        var header = new Grid();
+        foreach (var width in new[] { GridLength.Auto, new GridLength(1, GridUnitType.Star), GridLength.Auto, GridLength.Auto }) header.ColumnDefinitions.Add(new ColumnDefinition { Width = width });
+        heading.Margin = new Thickness(0, 0, 20, 0); header.Children.Add(heading);
+        status.TextTrimming = TextTrimming.CharacterEllipsis; status.TextWrapping = TextWrapping.NoWrap; status.TextAlignment = TextAlignment.Right;
+        Grid.SetColumn(status, 1); header.Children.Add(status);
+        Grid.SetColumn(busy, 2); header.Children.Add(busy);
+        var appearance = AppearanceSwitch(); appearance.Margin = new Thickness(12, 0, 0, 0);
+        Grid.SetColumn(appearance, 3); header.Children.Add(appearance);
+        top.Child = header;
         main.Children.Add(top);
         Grid.SetRow(content, 1); main.Children.Add(content);
         session.PropertyChanged += SessionChanged;
         Closed += (_, _) => DisposeSession();
+        PreviewKeyDown += (_, args) =>
+        {
+            if (args.Key == Key.N && Keyboard.Modifiers == ModifierKeys.Control && session.Screen == Screen.Home && !session.IsBusy && modalKind.Length == 0)
+            { args.Handled = true; StartCreate(); }
+        };
         SizeChanged += (_, _) => { if (overlayHost.Children.Count > 0 && overlayHost.Children[0] is Border { Child: ScrollViewer scroll }) scroll.MaxHeight = Math.Max(300, ActualHeight - 90); };
         resourceTimer.Tick += (_, _) => RefreshResources();
         activityTimer.Interval = TimeSpan.FromSeconds(1);
@@ -114,29 +126,39 @@ public sealed partial class PrismWindow : Window
             Screen.Home => "Home", Screen.Settings => "Settings", Screen.Create or Screen.ImportSource => "Create Shorts",
             _ => session.Project?.DisplayTitle ?? "Editor",
         };
-        status.Text = session.Message;
-        layout.ColumnDefinitions[0].Width = new GridLength(session.Screen == Screen.Editor ? 0 : 238);
-        sidePanel.Visibility = session.Screen == Screen.Editor ? Visibility.Collapsed : Visibility.Visible;
+        // Like the Mac app, only the import flow shows the running status line; elsewhere errors arrive as notices.
+        status.Text = session.Screen is Screen.Create or Screen.ImportSource ? session.Message : "";
+        busy.Visibility = session.IsBusy ? Visibility.Visible : Visibility.Collapsed;
+        var editing = session.Screen == Screen.Editor;
+        layout.ColumnDefinitions[0].Width = new GridLength(editing ? 0 : sidebarCollapsed ? 76 : 252);
+        sidePanel.Visibility = top.Visibility = editing ? Visibility.Collapsed : Visibility.Visible;
         foreach (var (screen, button) in navButtons)
         {
             button.IsEnabled = !session.IsBusy;
-            button.SetResourceReference(Control.BorderBrushProperty, session.Screen == screen ? "Accent" : "Line");
+            if (screen == Screen.ImportSource) continue;
+            var selected = session.Screen == screen;
+            if (selected) button.SetResourceReference(Control.BackgroundProperty, "Surface2"); else button.Background = Brushes.Transparent;
+            button.FontWeight = selected ? FontWeights.Medium : FontWeights.Normal;
+            if (screen == Screen.Editor) button.Visibility = session.Project is null ? Visibility.Collapsed : Visibility.Visible;
         }
         var key = session.Screen switch
         {
             Screen.Home => $"home:{homeRevision}:{showAll}:{showUnfinished}:{openFolder}",
             Screen.Create or Screen.ImportSource => $"create:{createStep}:{session.ShortsSource?.Id}",
-            Screen.Settings => "settings", _ => "editor",
+            Screen.Settings => $"settings:{settingsCategory}", _ => "editor",
         };
         if (renderedScreen != key)
         {
             renderedScreen = key; updateScreen = null;
+            var page = session.Screen.ToString();
             content.Content = null;
             content.Content = session.Screen switch
             {
                 Screen.Home => Home(), Screen.Settings => SettingsPage(),
                 Screen.Create or Screen.ImportSource => CreateFlow(), _ => editor.Widget,
             };
+            // A short fade when the page itself changes, like the Mac app's screen transitions; re-renders of the same page stay still.
+            if (page != renderedPage) { renderedPage = page; content.BeginAnimation(OpacityProperty, new System.Windows.Media.Animation.DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(160))); }
         }
         updateScreen?.Invoke();
         editor.Refresh();
@@ -161,25 +183,86 @@ public sealed partial class PrismWindow : Window
 
     void BuildSidebar()
     {
-        navigation.Children.Add(BrandMark());
-        navigation.Children.Add(new Border { Height = 24 });
-        AddNavigation("Home", Screen.Home, () => Navigate(Screen.Home));
-        AddNavigation("Create Shorts", Screen.ImportSource, StartCreate, true);
-        AddNavigation("Editor", Screen.Editor, () => Navigate(Screen.Editor));
-        AddNavigation("Settings", Screen.Settings, () => Navigate(Screen.Settings));
-        navigation.Children.Add(new Border { Height = 34 });
-        navigation.Children.Add(Button("Open library", session.RevealLibrary));
-        navigation.Children.Add(Text("RAM used", 11, muted: true)); navigation.Children.Add(memory); navigation.Children.Add(memoryBar);
-        navigation.Children.Add(new Border { Height = 12 });
-        navigation.Children.Add(Text("Storage free", 11, muted: true)); navigation.Children.Add(storage); navigation.Children.Add(storageBar);
-        navigation.Children.Add(new Border { Height = 24 });
-        navigation.Children.Add(Text("One in. Many out.", muted: true));
+        navigation.Children.Clear(); navButtons.Clear();
+        navigation.Margin = new Thickness(sidebarCollapsed ? 14 : 24);
+        var upper = new StackPanel(); DockPanel.SetDock(upper, Dock.Top);
+        var lower = new StackPanel(); DockPanel.SetDock(lower, Dock.Bottom);
+        if (sidebarCollapsed)
+        {
+            var expand = Link(Button("", () => { sidebarCollapsed = false; BuildSidebar(); Refresh(); }));
+            expand.Content = Glyph("", 18); expand.HorizontalAlignment = HorizontalAlignment.Center; expand.ToolTip = "Expand sidebar";
+            AutomationProperties.SetName(expand, "Expand sidebar"); upper.Children.Add(expand);
+        }
+        else
+        {
+            var brand = new DockPanel();
+            var collapse = Link(Button("", () => { sidebarCollapsed = true; BuildSidebar(); Refresh(); }));
+            collapse.Content = Glyph("", 14); collapse.ToolTip = "Collapse sidebar";
+            AutomationProperties.SetName(collapse, "Collapse sidebar");
+            DockPanel.SetDock(collapse, Dock.Right); brand.Children.Add(collapse);
+            var mark = Mark(24); mark.Margin = new Thickness(0, 0, 10, 0);
+            var name = Text("Prism", 24, display: true); name.Margin = new Thickness(0);
+            brand.Children.Add(Row(mark, name));
+            upper.Children.Add(brand);
+            var tagline = Text("Your video editor · Cloud AI", 12, muted: true); tagline.Margin = new Thickness(0, 12, 0, 0);
+            upper.Children.Add(tagline);
+        }
+        upper.Children.Add(Divider(new Thickness(0, 22, 0, 22)));
+        upper.Children.Add(NavItem("", "Home", Screen.Home, () => Navigate(Screen.Home)));
+        upper.Children.Add(NavItem("", "Create Shorts", Screen.ImportSource, StartCreate, prominent: true));
+        upper.Children.Add(NavItem("", "Editor", Screen.Editor, () => Navigate(Screen.Editor)));
+        lower.Children.Add(NavItem("", "Settings", Screen.Settings, () => Navigate(Screen.Settings)));
+        lower.Children.Add(sidebarCollapsed ? RamRing() : ResourceSummary());
+        navigation.Children.Add(upper); navigation.Children.Add(lower);
+        RefreshResources();
     }
-    void AddNavigation(string title, Screen screen, Action action, bool primary = false)
+    Button NavItem(string glyph, string title, Screen screen, Action action, bool prominent = false)
     {
-        var button = Button(title, action, primary);
-        button.HorizontalContentAlignment = HorizontalAlignment.Left;
-        navButtons[screen] = button; navigation.Children.Add(button);
+        var vertical = prominent ? 13 : 10;
+        var button = Button("", action);
+        button.BorderThickness = new Thickness(0); button.Padding = new Thickness(12, vertical, 12, vertical); button.Margin = new Thickness(0, 0, 0, 6);
+        button.FontSize = 14; button.FontWeight = prominent ? FontWeights.Medium : FontWeights.Normal; button.ToolTip = title; button.HorizontalAlignment = HorizontalAlignment.Stretch;
+        button.HorizontalContentAlignment = sidebarCollapsed ? HorizontalAlignment.Center : HorizontalAlignment.Left;
+        AutomationProperties.SetName(button, title);
+        if (sidebarCollapsed) button.Content = Glyph(glyph, 16);
+        else { var mark = Glyph(glyph, 15); mark.Margin = new Thickness(0, 0, 12, 0); button.Content = Row(mark, Label(title, 14)); }
+        if (prominent) { button.SetResourceReference(Control.BackgroundProperty, "Action"); button.Foreground = OnAction; }
+        navButtons[screen] = button;
+        return button;
+    }
+    UIElement ResourceSummary()
+    {
+        var panel = new StackPanel { Margin = new Thickness(0, 17, 0, 0), ToolTip = "RAM and available storage refresh at the interval set in Settings" };
+        var title = Text("System resources", 11, muted: true); title.FontWeight = FontWeights.Medium; title.Margin = new Thickness(0, 0, 0, 8);
+        panel.Children.Add(title);
+        memory = Text("", 11, muted: true, mono: true); storage = Text("", 11, muted: true, mono: true);
+        memoryBar = new ProgressBar { Height = 4, Maximum = 1, Margin = new Thickness(0, 4, 0, 12) };
+        storageBar = new ProgressBar { Height = 4, Maximum = 1, Margin = new Thickness(0, 4, 0, 0) };
+        panel.Children.Add(ResourceLine("", "RAM used", memory)); panel.Children.Add(memoryBar);
+        panel.Children.Add(ResourceLine("", "Storage free", storage)); panel.Children.Add(storageBar);
+        ring = null;
+        return panel;
+    }
+    static DockPanel ResourceLine(string glyph, string title, TextBlock value)
+    {
+        var line = new DockPanel();
+        value.Margin = new Thickness(4, 0, 0, 0); DockPanel.SetDock(value, Dock.Right); line.Children.Add(value);
+        var mark = Glyph(glyph, 11, "Muted"); mark.Margin = new Thickness(0, 0, 6, 0);
+        var label = Text(title, 11, muted: true); label.FontWeight = FontWeights.Medium; label.Margin = new Thickness(0);
+        line.Children.Add(Row(mark, label));
+        return line;
+    }
+    /// The collapsed sidebar shows RAM as a ring, like the Mac app.
+    UIElement RamRing()
+    {
+        var host = new Grid { Width = 44, Height = 44, Margin = new Thickness(0, 17, 0, 0), HorizontalAlignment = HorizontalAlignment.Center };
+        var track = new Ellipse { StrokeThickness = 4 }; track.SetResourceReference(Shape.StrokeProperty, "Line"); host.Children.Add(track);
+        ring = new System.Windows.Shapes.Path { StrokeThickness = 4, StrokeStartLineCap = PenLineCap.Round, StrokeEndLineCap = PenLineCap.Round }; ring.SetResourceReference(Shape.StrokeProperty, "Ink");
+        host.Children.Add(ring);
+        ringLabel = Text("", 9, display: true); ringLabel.Margin = new Thickness(0); ringLabel.TextAlignment = TextAlignment.Center; ringLabel.HorizontalAlignment = HorizontalAlignment.Center;
+        host.Children.Add(ringLabel);
+        memory = new TextBlock(); storage = new TextBlock(); memoryBar = new ProgressBar(); storageBar = new ProgressBar();
+        return host;
     }
     void RestartResourceTimer()
     {
@@ -193,6 +276,55 @@ public sealed partial class PrismWindow : Window
         memory.Text = string.Create(CultureInfo.InvariantCulture, $"{profile.MemoryUsedGB:0.0} / {profile.MemoryGB} GB");
         storage.Text = $"{profile.FreeGB} / {profile.StorageGB} GB";
         memoryBar.Value = profile.MemoryUsage; storageBar.Value = profile.FreeStorageRatio;
+        if (ring is null) return;
+        var used = Math.Clamp(profile.MemoryUsage, 0, 0.9999);
+        var angle = used * 2 * Math.PI;
+        var figure = new PathFigure { StartPoint = new Point(22, 2) };
+        figure.Segments.Add(new ArcSegment(new Point(22 + 20 * Math.Sin(angle), 22 - 20 * Math.Cos(angle)), new Size(20, 20), 0, used > 0.5, SweepDirection.Clockwise, true));
+        ring.Data = new PathGeometry([figure]);
+        ringLabel.Text = $"{(int)(profile.MemoryUsage * 100)}%\nRAM";
+        ring.ToolTip = string.Create(CultureInfo.InvariantCulture, $"RAM used: {profile.MemoryUsedGB:0.0} of {profile.MemoryGB} GB · Storage free: {profile.FreeGB} of {profile.StorageGB} GB");
+    }
+
+    /// The dark/light switch: two icon segments in a pill, shared with the editor header.
+    internal FrameworkElement AppearanceSwitch()
+    {
+        var row = new StackPanel { Orientation = Orientation.Horizontal };
+        var pill = new Border { Child = row, Padding = new Thickness(2), CornerRadius = new CornerRadius(8), VerticalAlignment = VerticalAlignment.Center };
+        pill.SetResourceReference(Border.BackgroundProperty, "Surface2");
+        foreach (var (mode, glyph, title) in new[] { ("dark", "", "Dark mode"), ("light", "", "Light mode") })
+        {
+            var button = new Button { Content = Glyph(glyph, 12), Width = 30, Height = 24, Padding = new Thickness(0), Margin = new Thickness(0), ToolTip = title, HorizontalContentAlignment = HorizontalAlignment.Center };
+            AutomationProperties.SetName(button, title);
+            button.Click += (_, _) => { session.Settings.Appearance = mode; session.Settings.Save(); ApplyTheme(); };
+            void Update()
+            {
+                var selected = (session.Settings.Appearance == "light" ? "light" : "dark") == mode;
+                if (selected) { button.SetResourceReference(BackgroundProperty, "Surface1"); button.SetResourceReference(BorderBrushProperty, "Line"); button.SetResourceReference(ForegroundProperty, "Ink"); }
+                else { button.Background = button.BorderBrush = Brushes.Transparent; button.SetResourceReference(ForegroundProperty, "Muted"); }
+            }
+            Update(); appearanceUpdates.Add(Update); row.Children.Add(button);
+        }
+        return pill;
+    }
+
+    [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
+    static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);
+
+    /// Paints the Windows title bar in the app's colors (Windows 11), and dark when the theme is dark (Windows 10 too).
+    void TintTitleBar()
+    {
+        var handle = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        if (handle == IntPtr.Zero) return;
+        static int Ref(Color color) => color.R | color.G << 8 | color.B << 16;
+        var dark = session.Settings.Appearance == "light" ? 0 : 1;
+        var caption = Ref(((SolidColorBrush)Resources["Surface1"]).Color);
+        var text = Ref(((SolidColorBrush)Resources["Ink"]).Color);
+        var border = Ref(((SolidColorBrush)Resources["Line"]).Color);
+        _ = DwmSetWindowAttribute(handle, 20, ref dark, sizeof(int));
+        _ = DwmSetWindowAttribute(handle, 35, ref caption, sizeof(int));
+        _ = DwmSetWindowAttribute(handle, 36, ref text, sizeof(int));
+        _ = DwmSetWindowAttribute(handle, 34, ref border, sizeof(int));
     }
 
     Task ChooseVideo()
@@ -207,6 +339,7 @@ public sealed partial class PrismWindow : Window
         return dialog.ShowDialog(this) == true ? dialog.FolderName : null;
     }
 
+    static SolidColorBrush Frozen(Color color) { var brush = new SolidColorBrush(color); brush.Freeze(); return brush; }
     static StackPanel Column(params UIElement[] children)
     {
         var panel = new StackPanel(); foreach (var child in children) panel.Children.Add(child); return panel;
@@ -223,28 +356,98 @@ public sealed partial class PrismWindow : Window
         label.FontWeight = display ? FontWeights.Medium : FontWeights.Normal;
         return label;
     }
-    Button Button(string title, Action action, bool primary = false, bool danger = false)
+    /// Text that takes its color and font from the control it sits in, so primary buttons keep ink text.
+    static TextBlock Label(string text, double size = 0)
     {
-        var button = NewButton(title, primary, danger);
+        var label = new TextBlock { Text = text, VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis };
+        if (size > 0) label.FontSize = size;
+        return label;
+    }
+    /// A Segoe Fluent glyph; without a brush key it follows the surrounding foreground.
+    static TextBlock Glyph(string glyph, double size = 14, string? brush = null)
+    {
+        var icon = new TextBlock { Text = glyph, FontFamily = new FontFamily(IconFont), FontSize = size, VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center };
+        if (brush is not null) icon.SetResourceReference(TextBlock.ForegroundProperty, brush);
+        return icon;
+    }
+    /// The Prism mark: amber and coral faces over a Sky base, the same geometry as the Mac app's mark.
+    internal static FrameworkElement Mark(double height)
+    {
+        var canvas = new Canvas { Width = 184, Height = 202 };
+        Point P(double x, double y) => new(x * 184, y * 202);
+        void Face(string color, params Point[] points)
+        {
+            var polygon = new Polygon { Fill = Frozen((Color)ColorConverter.ConvertFromString(color)) };
+            foreach (var point in points) polygon.Points.Add(point);
+            canvas.Children.Add(polygon);
+        }
+        Point apex = P(0.5, 0), left = P(0, 0.797), right = P(1, 0.797), center = P(0.5, 0.545), bottom = P(0.5, 1);
+        Face("#FFC233", apex, left, center); Face("#FF6B57", apex, right, center);
+        Face("#3FA9F5", left, center, right); Face("#3996DA", left, right, bottom);
+        return new Viewbox { Child = canvas, Height = height, VerticalAlignment = VerticalAlignment.Center };
+    }
+    static Border Divider(Thickness margin)
+    {
+        var line = new Border { Height = 1, Margin = margin }; line.SetResourceReference(Border.BackgroundProperty, "Line"); return line;
+    }
+    /// A Mac-style check: a ring, filled with a check when selected.
+    internal static Grid CheckCircle(bool selected)
+    {
+        var host = new Grid { Width = 18, Height = 18, VerticalAlignment = VerticalAlignment.Center };
+        var circle = new Ellipse { StrokeThickness = 1.5 };
+        if (selected) { circle.SetResourceReference(Shape.FillProperty, "Accent"); circle.SetResourceReference(Shape.StrokeProperty, "Accent"); }
+        else circle.SetResourceReference(Shape.StrokeProperty, "Muted");
+        host.Children.Add(circle);
+        if (selected) host.Children.Add(Glyph("", 10, "Surface1"));
+        return host;
+    }
+    /// Columns of at least `min` wide that share the row, like SwiftUI's adaptive grid.
+    internal static WrapPanel AdaptiveGrid(double min, IEnumerable<UIElement> items, double spacing = 12)
+    {
+        var grid = new WrapPanel();
+        foreach (var item in items) { if (item is FrameworkElement element) element.Margin = new Thickness(0, 0, spacing, spacing); grid.Children.Add(item); }
+        grid.SizeChanged += (_, args) =>
+        {
+            if (!args.WidthChanged || args.NewSize.Width <= 0) return;
+            var columns = Math.Max(1, (int)((args.NewSize.Width + spacing) / (min + spacing)));
+            grid.ItemWidth = Math.Floor(args.NewSize.Width / columns);
+        };
+        return grid;
+    }
+    Button Button(string title, Action action, bool primary = false, bool danger = false, string? icon = null)
+    {
+        var button = NewButton(title, primary, danger, icon);
         button.Click += (_, _) => { try { action(); } catch (Exception error) { ShowNotice("Could not complete action", error.Message); } };
         return button;
     }
-    Button Button(string title, Func<Task> action, bool primary = false, bool danger = false)
+    Button Button(string title, Func<Task> action, bool primary = false, bool danger = false, string? icon = null)
     {
-        var button = NewButton(title, primary, danger);
+        var button = NewButton(title, primary, danger, icon);
         button.Click += async (_, _) => { try { await action(); } catch (Exception error) { ShowNotice("Could not complete action", error.Message); } };
         return button;
     }
-    static Button NewButton(string title, bool primary, bool danger)
+    static Button NewButton(string title, bool primary, bool danger, string? icon = null)
     {
-        var button = new Button { Content = title, Margin = new Thickness(0, 4, 8, 4), Padding = new Thickness(13, 10, 13, 10), MinHeight = 36 };
-        if (primary) { button.SetResourceReference(Control.BackgroundProperty, "Action"); button.Foreground = new SolidColorBrush(Color.FromRgb(14, 15, 20)); }
+        var button = new Button { Margin = new Thickness(0, 4, 8, 4), Padding = new Thickness(16, 0, 16, 0), MinHeight = 40, FontSize = 14, HorizontalAlignment = HorizontalAlignment.Left, HorizontalContentAlignment = HorizontalAlignment.Center };
+        if (icon is null) button.Content = title;
+        else { var mark = Glyph(icon, 12); mark.Margin = new Thickness(0, 0, 8, 0); button.Content = Row(mark, Label(title)); }
+        if (primary) { button.SetResourceReference(Control.BackgroundProperty, "Action"); button.SetResourceReference(Control.BorderBrushProperty, "Action"); button.Foreground = OnAction; }
         if (danger) button.SetResourceReference(Control.ForegroundProperty, "Coral");
+        return button;
+    }
+    /// No outline until hovered: the Mac app's ghost buttons.
+    static Button Ghost(Button button) { button.BorderBrush = Brushes.Transparent; return button; }
+    /// Small text or icon buttons: muted, compact, a soft fill on hover.
+    static Button Link(Button button)
+    {
+        button.BorderBrush = Brushes.Transparent; button.MinHeight = 0; button.Padding = new Thickness(8, 5, 8, 5); button.FontSize = 13;
+        button.HorizontalAlignment = HorizontalAlignment.Left; button.SetResourceReference(Control.ForegroundProperty, "Muted");
         return button;
     }
     static TextBox Entry(string value, string placeholder, Action<string>? changed = null)
     {
-        var entry = new TextBox { Text = value, ToolTip = placeholder, MinWidth = 80, Margin = new Thickness(0, 4, 8, 4), Padding = new Thickness(10) };
+        var entry = new TextBox { Text = value, Tag = placeholder, MinWidth = 80, Margin = new Thickness(0, 4, 8, 4), Padding = new Thickness(10) };
+        AutomationProperties.SetName(entry, placeholder);
         if (changed is not null) entry.TextChanged += (_, _) => changed(entry.Text);
         return entry;
     }
@@ -254,8 +457,15 @@ public sealed partial class PrismWindow : Window
         border.SetResourceReference(Border.BackgroundProperty, "Surface1"); border.SetResourceReference(Border.BorderBrushProperty, "Line");
         return border;
     }
+    /// A borderless page panel: Surface1 on the page, the Mac app's cards.
+    static Border Surface(UIElement child, double radius = 16, double padding = 18)
+    {
+        var border = new Border { Child = child, CornerRadius = new CornerRadius(radius), Padding = new Thickness(padding) };
+        border.SetResourceReference(Border.BackgroundProperty, "Surface1");
+        return border;
+    }
     static ScrollViewer Scroll(UIElement child) => new() { Content = child, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
-    static StackPanel Field(string title, UIElement child) => Column(Text(title, muted: true), child);
+    static StackPanel Field(string title, UIElement child) => Column(Text(title, 12, muted: true), child);
     static Grid SplitRow(UIElement left, UIElement right)
     {
         var row = new Grid { Margin = new Thickness(0, 4, 0, 4) };
@@ -279,8 +489,9 @@ public sealed partial class PrismWindow : Window
     }
     static UIElement BrandMark()
     {
-        var path = Path.Combine(AppContext.BaseDirectory, "Brand", "Prism.png");
-        return File.Exists(path) ? Row(new Image { Source = new BitmapImage(new Uri(path)), Width = 34, Height = 34, Margin = new Thickness(0, 0, 10, 0) }, Text("Prism", 29, display: true)) : Text("Prism", 29, display: true);
+        var mark = Mark(26); mark.Margin = new Thickness(0, 0, 10, 0);
+        var name = Text("Prism", 22, display: true); name.Margin = new Thickness(0);
+        return Row(mark, name);
     }
     void DisposeSession()
     {
