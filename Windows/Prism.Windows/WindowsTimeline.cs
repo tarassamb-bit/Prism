@@ -46,11 +46,11 @@ public sealed class WindowsTimeline : IDisposable
     readonly AppSession session;
     readonly Grid root = new();
     readonly TrackSurface surface;
-    readonly Button undo = new() { Content = "↶", ToolTip = "Undo edit · Ctrl+Z" };
-    readonly Button audio = new() { Content = "Audio", ToolTip = "Toggle clip audio" };
+    readonly Button undo = new() { Content = "\uE7A7", FontFamily = new FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets"), ToolTip = "Undo edit · Ctrl+Z" };
+    readonly Button audio = new() { Content = "\uE767", FontFamily = new FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets"), ToolTip = "Toggle clip audio" };
     readonly Button add = new() { Content = "Add clip" };
-    readonly Button generate = new() { Content = "Auto Shorts" };
-    readonly Button settings = new() { Content = "⚙", ToolTip = "Auto Shorts settings" };
+    readonly Button generate = new() { Content = "✦  Auto Shorts" };
+    readonly Button settings = new() { Content = "\uE713", FontFamily = new FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets"), ToolTip = "Auto Shorts settings" };
     readonly TextBlock title = new() { Text = "Source timeline", VerticalAlignment = VerticalAlignment.Center };
     readonly List<BitmapSource> frames = [];
     readonly Dictionary<string, float[]> waveforms = [];
@@ -85,11 +85,14 @@ public sealed class WindowsTimeline : IDisposable
         };
         root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-        var toolbar = new DockPanel { Margin = new Thickness(16, 8, 16, 8), LastChildFill = true };
+        var toolbar = new DockPanel { Margin = new Thickness(16, 0, 16, 0), Height = 42, LastChildFill = true };
         var leading = new StackPanel { Orientation = Orientation.Horizontal };
         var trailing = new StackPanel { Orientation = Orientation.Horizontal };
-        foreach (var button in new[] { undo, audio, add, generate, settings }) button.Margin = new Thickness(0, 0, 8, 0);
-        leading.Children.Add(undo); leading.Children.Add(audio);
+        foreach (var button in new[] { undo, audio, add, generate, settings })
+        { button.Margin = new Thickness(0, 0, 4, 0); button.BorderBrush = Brushes.Transparent; button.Padding = new Thickness(9, 5, 9, 5); button.FontSize = 12; button.VerticalAlignment = VerticalAlignment.Center; }
+        var rule = new Border { Width = 1, Height = 16, Margin = new Thickness(10, 0, 14, 0), VerticalAlignment = VerticalAlignment.Center }; rule.SetResourceReference(Border.BackgroundProperty, "Line");
+        title.FontSize = 11; title.FontWeight = FontWeights.Medium;
+        leading.Children.Add(undo); leading.Children.Add(audio); leading.Children.Add(rule);
         trailing.Children.Add(add); trailing.Children.Add(generate); trailing.Children.Add(settings);
         DockPanel.SetDock(leading, Dock.Left); DockPanel.SetDock(trailing, Dock.Right);
         toolbar.Children.Add(leading); toolbar.Children.Add(trailing); toolbar.Children.Add(title);
@@ -129,7 +132,7 @@ public sealed class WindowsTimeline : IDisposable
         root.Background = Brush("171920", "FFFFFF");
         undo.IsEnabled = session.CanUndo && !Blocked;
         audio.IsEnabled = session.ActiveSegment is not null && !Blocked;
-        audio.Content = session.ActiveSegment?.IsMuted == true ? "Muted" : "Audio";
+        audio.Content = session.ActiveSegment?.IsMuted == true ? "\uE74F" : "\uE767";
         add.IsEnabled = generate.IsEnabled = Media is not null && !Blocked;
         settings.IsEnabled = !Blocked;
         var media = Media; var start = session.ActiveSegment?.Start ?? 0; var length = Length;
@@ -260,7 +263,7 @@ public sealed class WindowsTimeline : IDisposable
         {
             var x = Left + plotWidth * index / 6;
             dc.DrawLine(new Pen(Brush("2C2F37", "E2DED4", 0.7), 1), new Point(x, 24), new Point(x, AudioY + AudioHeight));
-            Text(dc, Format.Clock(length * index / 6), x - (index == 6 ? 39 : 0), 4, 50, true, true);
+            if (session.ActiveSegment is not null || Media is not null) Text(dc, Format.Clock(length * index / 6), x - (index == 6 ? 39 : 0), 4, 50, true, true);
         }
         Text(dc, "Video", 16, VideoY + 23, 80, true); Text(dc, "Focus L↕R", 16, FocusY + 7, 80, true);
         Text(dc, "Text", 16, TextY + 9, 80, true); Text(dc, "Audio", 16, AudioY + 11, 80, true);
