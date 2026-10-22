@@ -85,16 +85,16 @@ public sealed partial class PrismWindow
     {
         var hero = Button("", StartCreate);
         hero.SetResourceReference(StyleProperty, "Hero"); hero.SetResourceReference(BackgroundProperty, "Action");
-        hero.Foreground = OnAction; hero.BorderThickness = new Thickness(0); hero.MinHeight = 104; hero.Padding = new Thickness(24, 18, 24, 18); hero.Margin = new Thickness(0);
+        hero.Foreground = OnAction; hero.BorderThickness = new Thickness(0); hero.MinHeight = 86; hero.Padding = new Thickness(22, 16, 26, 16); hero.Margin = new Thickness(0);
         hero.ToolTip = "Start creating · Ctrl+N"; hero.HorizontalAlignment = HorizontalAlignment.Stretch; AutomationProperties.SetName(hero, "Start creating");
         var body = new Grid();
         foreach (var width in new[] { GridLength.Auto, new GridLength(1, GridUnitType.Star), GridLength.Auto }) body.ColumnDefinitions.Add(new ColumnDefinition { Width = width });
-        var plus = Glyph("", 26); plus.Margin = new Thickness(0, 0, 20, 0); body.Children.Add(plus);
-        var title = Label("Start creating", 22); title.SetResourceReference(TextBlock.FontFamilyProperty, "DisplayFont");
+        var plus = PlusTile(30, 15); plus.Margin = new Thickness(0, 0, 18, 0); body.Children.Add(plus);
+        var title = Label("Start creating", 22); title.SetResourceReference(TextBlock.FontFamilyProperty, "DisplayFont"); title.FontWeight = FontWeights.Medium;
         var detail = Label("One in. Many out. Choose a video and Prism finds the moments worth sharing.", 13);
-        detail.Opacity = 0.82; detail.TextWrapping = TextWrapping.Wrap; detail.Margin = new Thickness(0, 5, 0, 0);
+        detail.Opacity = 0.82; detail.FontWeight = FontWeights.Medium; detail.TextWrapping = TextWrapping.Wrap; detail.Margin = new Thickness(0, 5, 0, 0);
         var words = Column(title, detail); words.VerticalAlignment = VerticalAlignment.Center; Grid.SetColumn(words, 1); body.Children.Add(words);
-        var arrow = Glyph("", 18); arrow.Margin = new Thickness(12, 0, 0, 0); Grid.SetColumn(arrow, 2); body.Children.Add(arrow);
+        var arrow = new TextBlock { Text = "↗", FontFamily = new FontFamily("Segoe UI Symbol"), FontSize = 20, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(12, 0, 0, 0) }; Grid.SetColumn(arrow, 2); body.Children.Add(arrow);
         hero.Content = body;
         return hero;
     }
