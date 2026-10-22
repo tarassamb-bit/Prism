@@ -59,8 +59,8 @@ public sealed class WindowsEditor : IDisposable
         root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(5) });
         root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(session.Settings.TimelineHeight), MinHeight = 260 });
         root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        var header = new DockPanel { Margin = new Thickness(20, 0, 20, 0), Height = 54, LastChildFill = true };
-        var lights = ((PrismWindow)window).TrafficLights(); lights.Margin = new Thickness(0, 0, 18, 0); DockPanel.SetDock(lights, Dock.Left); header.Children.Add(lights);
+        // The right margin leaves room for the window's minimize, maximize and close buttons.
+        var header = new DockPanel { Margin = new Thickness(20, 0, 152, 0), Height = 54, LastChildFill = true };
         var home = Button("‹  Home", () => { player.Pause(); session.Screen = Screen.Home; }); Plain(home); home.ToolTip = "Back to projects"; DockPanel.SetDock(home, Dock.Left); header.Children.Add(home);
         var rule = new Border { Width = 1, Height = 20, Margin = new Thickness(10, 0, 16, 0) }; rule.SetResourceReference(Border.BackgroundProperty, "Line"); DockPanel.SetDock(rule, Dock.Left); header.Children.Add(rule);
         var mark = PrismWindow.Mark(20); mark.Margin = new Thickness(0, 0, 8, 0); DockPanel.SetDock(mark, Dock.Left); header.Children.Add(mark);
