@@ -57,6 +57,7 @@ public sealed class WindowsTimeline : IDisposable
     readonly DispatcherTimer timer;
     readonly FontFamily bodyFont = Font("Sora");
     readonly FontFamily monoFont = Font("JetBrains Mono");
+    readonly FontFamily iconFont = new("Segoe Fluent Icons, Segoe MDL2 Assets");
     CancellationTokenSource? resources;
     string? resourceKey;
     float[]? waveform;
@@ -248,6 +249,13 @@ public sealed class WindowsTimeline : IDisposable
         { MaxTextWidth = Math.Max(1, width), MaxLineCount = 1, Trimming = TextTrimming.CharacterEllipsis };
         dc.DrawText(text, new Point(x, y));
     }
+    /// A Mac-style track label: a muted icon, then the name.
+    void TrackLabel(DrawingContext dc, string glyph, string title, double y)
+    {
+        var icon = new FormattedText(glyph, CultureInfo.CurrentCulture, FlowDirection.LeftToRight, new Typeface(iconFont, FontStyles.Normal, FontWeights.Normal, FontStretches.Normal), 11,
+            Brush("8A8F98", "5C6068"), VisualTreeHelper.GetDpi(surface).PixelsPerDip);
+        dc.DrawText(icon, new Point(15, y + 2)); Text(dc, title, 33, y, 64, true);
+    }
     static Geometry Line(Point from, Point to)
     {
         var path = new StreamGeometry(); using (var context = path.Open()) { context.BeginFigure(from, false, false); context.LineTo(to, true, false); }
@@ -257,7 +265,7 @@ public sealed class WindowsTimeline : IDisposable
     {
         plotWidth = Math.Max(1, width - Left - Right);
         dc.DrawRectangle(Brush("171920", "FFFFFF"), null, Rect(0, 0, width, height));
-        dc.DrawRectangle(Brush("0E0F14", "EDE9E0"), null, Rect(0, 0, 100, height));
+        dc.DrawRectangle(Brush("20232B", "EDE9E0"), null, Rect(0, 0, 100, height));
         var length = Length;
         for (var index = 0; index <= 6; index++)
         {
@@ -265,8 +273,8 @@ public sealed class WindowsTimeline : IDisposable
             dc.DrawLine(new Pen(Brush("2C2F37", "E2DED4", 0.7), 1), new Point(x, 24), new Point(x, AudioY + AudioHeight));
             if (session.ActiveSegment is not null || Media is not null) Text(dc, Format.Clock(length * index / 6), x - (index == 6 ? 39 : 0), 4, 50, true, true);
         }
-        Text(dc, "Video", 16, VideoY + 23, 80, true); Text(dc, "Focus L↕R", 16, FocusY + 7, 80, true);
-        Text(dc, "Text", 16, TextY + 9, 80, true); Text(dc, "Audio", 16, AudioY + 11, 80, true);
+        TrackLabel(dc, "\uE714", "Video", VideoY + 23); TrackLabel(dc, "\uE8B3", "Focus L↕R", FocusY + 7);
+        TrackLabel(dc, "\uE8D2", "Text", TextY + 9); TrackLabel(dc, "\uE720", "Audio", AudioY + 11);
         DrawVideo(dc, length); DrawFocus(dc, length); DrawText(dc, length); DrawAudio(dc);
         var time = session.Player?.CurrentTime ?? 0;
         var xHead = Left + plotWidth * Math.Clamp(double.IsFinite(time) ? time / length : 0, 0, 1);
@@ -278,7 +286,7 @@ public sealed class WindowsTimeline : IDisposable
     void DrawVideo(DrawingContext dc, double length)
     {
         var track = Rect(Left, VideoY, plotWidth, VideoHeight);
-        dc.DrawRoundedRectangle(Brush("20232B", "EDE9E0"), null, track, 7, 7);
+        dc.DrawRoundedRectangle(Brush("20232B", "EDE9E0"), null, track, 8, 8);
         dc.PushClip(new RectangleGeometry(track, 7, 7));
         for (var index = 0; index < frames.Count; index++)
         {
@@ -297,12 +305,12 @@ public sealed class WindowsTimeline : IDisposable
             }
         if (Media is { } source)
         {
-            var labelWidth = Math.Max(1, Math.Min(plotWidth - 12, 240));
-            dc.DrawRoundedRectangle(new SolidColorBrush(Color.FromArgb(150, 0, 0, 0)), null, Rect(Left + 6, VideoY + 6, labelWidth, 20), 3, 3);
-            // The source badge always uses light text on its dark backing.
-            dc.PushClip(new RectangleGeometry(Rect(Left + 6, VideoY + 6, labelWidth, 20)));
-            var name = new FormattedText(source.Name, CultureInfo.CurrentCulture, FlowDirection.LeftToRight, new Typeface(bodyFont, FontStyles.Normal, FontWeights.Normal, FontStretches.Normal), 10,
-                Brushes.White, VisualTreeHelper.GetDpi(surface).PixelsPerDip);
+            // The source badge always uses light text on its dark backing, and is as wide as the name.
+            var name = new FormattedText(source.Name, CultureInfo.CurrentCulture, FlowDirection.LeftToRight, new Typeface(bodyFont, FontStyles.Normal, FontWeights.Medium, FontStretches.Normal), 11,
+                Brushes.White, VisualTreeHelper.GetDpi(surface).PixelsPerDip) { MaxLineCount = 1, Trimming = TextTrimming.CharacterEllipsis, MaxTextWidth = Math.Max(1, plotWidth - 22) };
+            var labelWidth = Math.Max(1, Math.Min(plotWidth - 12, name.Width + 10));
+            dc.DrawRoundedRectangle(new SolidColorBrush(Color.FromArgb(140, 0, 0, 0)), null, Rect(Left + 6, VideoY + 6, labelWidth, 22), 3, 3);
+            dc.PushClip(new RectangleGeometry(Rect(Left + 6, VideoY + 6, labelWidth, 22)));
             dc.DrawText(name, new Point(Left + 11, VideoY + 9)); dc.Pop();
         }
         else Text(dc, "Add a video to start your timeline", Left + 12, VideoY + 23, plotWidth - 24, true);
@@ -317,7 +325,7 @@ public sealed class WindowsTimeline : IDisposable
         var points = clip?.CropKeyframes?.OrderBy(p => p.Time).ToList() ?? [];
         var offset = (clip?.CropPosition ?? 0.5) - 0.5;
         Point Position(CropKeyframe point) => new(Left + plotWidth * Math.Clamp(point.Time / length, 0, 1), FocusY + 3 + (1 - Math.Clamp(point.Position + offset, 0, 1)) * (FocusHeight - 6));
-        var pen = new Pen(Brush("3FA9F5", "0B6CB5"), 2);
+        var pen = new Pen(Brush("3FA9F5", "0B6CB5"), 2) { StartLineCap = PenLineCap.Round, EndLineCap = PenLineCap.Round, LineJoin = PenLineJoin.Round };
         if (points.Count == 1) dc.DrawLine(pen, new Point(Left, Position(points[0]).Y), new Point(Left + plotWidth, Position(points[0]).Y));
         else for (var index = 1; index < points.Count; index++)
             if (points[index].IsSceneCut != true) dc.DrawGeometry(null, pen, Line(Position(points[index - 1]), Position(points[index])));
@@ -333,7 +341,7 @@ public sealed class WindowsTimeline : IDisposable
     }
     void DrawText(DrawingContext dc, double length)
     {
-        dc.DrawRoundedRectangle(Brush("0E0F14", "EDE9E0"), null, Rect(Left, TextY, plotWidth, TextHeight), 4, 4);
+        dc.DrawRoundedRectangle(Brush("171920", "FFFFFF"), new Pen(Brush("2C2F37", "E2DED4"), 1), Rect(Left, TextY, plotWidth, TextHeight), 4, 4);
         if (session.ActiveSegment is not { } clip) { Text(dc, "Select a Short to edit text and subtitles", Left + 10, TextY + 9, plotWidth - 20, true); return; }
         if (!string.IsNullOrWhiteSpace(clip.Caption))
         {

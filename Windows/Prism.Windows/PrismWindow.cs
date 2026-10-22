@@ -35,7 +35,7 @@ public sealed partial class PrismWindow : Window
     ProgressBar memoryBar = new(), storageBar = new();
     System.Windows.Shapes.Path? ring;
     readonly Dictionary<Screen, Button> navButtons = [];
-    readonly List<Action> appearanceUpdates = [];
+    readonly List<Action> appearanceUpdates = [], lightUpdates = [];
     readonly DispatcherTimer resourceTimer = new();
     readonly DispatcherTimer activityTimer = new();
     readonly Dictionary<string, ProjectSummary> summaries = [];
@@ -56,6 +56,11 @@ public sealed partial class PrismWindow : Window
         MinWidth = 900; MinHeight = 620;
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         UseLayoutRounding = true; SnapsToDevicePixels = true;
+        // Prism draws its own title bar, with Mac-style window lights, so the page runs to the top edge like the Mac app.
+        System.Windows.Shell.WindowChrome.SetWindowChrome(this, new System.Windows.Shell.WindowChrome { CaptionHeight = 0, ResizeBorderThickness = new Thickness(6), GlassFrameThickness = new Thickness(0, 0, 0, 1), UseAeroCaptionButtons = false });
+        StateChanged += (_, _) => FitMaximized();
+        Activated += (_, _) => { foreach (var update in lightUpdates) update(); };
+        Deactivated += (_, _) => { foreach (var update in lightUpdates) update(); };
         SourceInitialized += (_, _) => TintTitleBar();
         session = new AppSession(new WindowsPlatform());
         session.RefreshGeminiKeyState();
@@ -91,7 +96,7 @@ public sealed partial class PrismWindow : Window
         Grid.SetColumn(busy, 2); header.Children.Add(busy);
         var appearance = AppearanceSwitch(); appearance.Margin = new Thickness(12, 0, 0, 0);
         Grid.SetColumn(appearance, 3); header.Children.Add(appearance);
-        top.Child = header;
+        top.Child = header; top.Background = Brushes.Transparent; top.MouseLeftButtonDown += (_, args) => DragFrom(args);
         main.Children.Add(top);
         Grid.SetRow(content, 1); main.Children.Add(content);
         session.PropertyChanged += SessionChanged;
@@ -189,13 +194,16 @@ public sealed partial class PrismWindow : Window
         var lower = new StackPanel(); DockPanel.SetDock(lower, Dock.Bottom);
         if (sidebarCollapsed)
         {
+            var lights = TrafficLights(6); lights.Margin = new Thickness(0, 0, 0, 16); lights.HorizontalAlignment = HorizontalAlignment.Center; upper.Children.Add(lights);
             var expand = Link(Button("", () => { sidebarCollapsed = false; BuildSidebar(); Refresh(); }));
             expand.Content = Glyph("", 18); expand.HorizontalAlignment = HorizontalAlignment.Center; expand.ToolTip = "Expand sidebar";
             AutomationProperties.SetName(expand, "Expand sidebar"); upper.Children.Add(expand);
         }
         else
         {
-            var brand = new DockPanel();
+            var lights = TrafficLights(); lights.Margin = new Thickness(0, 0, 0, 20); upper.Children.Add(lights);
+            var brand = new DockPanel { Background = Brushes.Transparent };
+            brand.MouseLeftButtonDown += (_, args) => DragFrom(args);
             var collapse = Link(Button("", () => { sidebarCollapsed = true; BuildSidebar(); Refresh(); }));
             collapse.Content = Glyph("", 14); collapse.ToolTip = "Collapse sidebar";
             AutomationProperties.SetName(collapse, "Collapse sidebar");
@@ -208,7 +216,7 @@ public sealed partial class PrismWindow : Window
             upper.Children.Add(tagline);
         }
         upper.Children.Add(Divider(new Thickness(0, 22, 0, 22)));
-        upper.Children.Add(NavItem("", "Home", Screen.Home, () => Navigate(Screen.Home)));
+        upper.Children.Add(NavItem("\uEA8A", "Home", Screen.Home, () => Navigate(Screen.Home)));
         upper.Children.Add(NavItem("", "Create Shorts", Screen.ImportSource, StartCreate, prominent: true));
         upper.Children.Add(NavItem("", "Editor", Screen.Editor, () => Navigate(Screen.Editor)));
         lower.Children.Add(NavItem("", "Settings", Screen.Settings, () => Navigate(Screen.Settings)));
@@ -224,8 +232,9 @@ public sealed partial class PrismWindow : Window
         button.FontSize = 14; button.FontWeight = prominent ? FontWeights.Medium : FontWeights.Normal; button.ToolTip = title; button.HorizontalAlignment = HorizontalAlignment.Stretch;
         button.HorizontalContentAlignment = sidebarCollapsed ? HorizontalAlignment.Center : HorizontalAlignment.Left;
         AutomationProperties.SetName(button, title);
-        if (sidebarCollapsed) button.Content = Glyph(glyph, 16);
-        else { var mark = Glyph(glyph, 15); mark.Margin = new Thickness(0, 0, 12, 0); button.Content = Row(mark, Label(title, 14)); }
+        FrameworkElement mark = prominent ? PlusTile(16, 9) : Glyph(glyph, sidebarCollapsed ? 16 : 15);
+        if (sidebarCollapsed) button.Content = mark;
+        else { mark.Margin = new Thickness(0, 0, 12, 0); button.Content = Row(mark, Label(title, 14)); }
         if (prominent) { button.SetResourceReference(Control.BackgroundProperty, "Action"); button.Foreground = OnAction; }
         navButtons[screen] = button;
         return button;
@@ -308,6 +317,51 @@ public sealed partial class PrismWindow : Window
         return pill;
     }
 
+    /// The Mac's close, minimize and zoom lights; their symbols show while the pointer is over the group, and they turn grey when the window is inactive.
+    internal FrameworkElement TrafficLights(double spacing = 8)
+    {
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Background = Brushes.Transparent, VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Left };
+        var symbols = new List<TextBlock>();
+        foreach (var (color, glyph, title, action) in new (string, string, string, Action)[]
+        {
+            ("#FF5F57", "\uE8BB", "Close", Close),
+            ("#FEBC2E", "\uE921", "Minimize", () => WindowState = WindowState.Minimized),
+            ("#28C840", "\uE740", "Zoom", () => WindowState = WindowState == WindowState.Maximized ? WindowState.Normal : WindowState.Maximized),
+        })
+        {
+            var fill = Frozen((Color)ColorConverter.ConvertFromString(color));
+            var dot = new Ellipse { Width = 12, Height = 12, Fill = fill, Stroke = Frozen(Color.FromArgb(40, 0, 0, 0)), StrokeThickness = 0.5 };
+            var symbol = new TextBlock { Text = glyph, FontFamily = new FontFamily(IconFont), FontSize = 6.5, Foreground = Frozen(Color.FromArgb(150, 0, 0, 0)), HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Visibility = Visibility.Hidden };
+            symbols.Add(symbol);
+            var face = new Grid(); face.Children.Add(dot); face.Children.Add(symbol);
+            var button = new Button { Content = face, Width = 12, Height = 12, Padding = new Thickness(0), Margin = new Thickness(0, 0, spacing, 0), BorderThickness = new Thickness(0), Focusable = false, ToolTip = title, Cursor = Cursors.Arrow };
+            button.Template = new ControlTemplate(typeof(Button)) { VisualTree = new FrameworkElementFactory(typeof(ContentPresenter)) };
+            AutomationProperties.SetName(button, title);
+            button.Click += (_, _) => action();
+            lightUpdates.Add(() => dot.Fill = IsActive || row.IsMouseOver ? fill : (Brush)Resources["Line"]);
+            row.Children.Add(button);
+        }
+        ((Button)row.Children[^1]).Margin = new Thickness(0);
+        row.MouseEnter += (_, _) => { foreach (var symbol in symbols) symbol.Visibility = Visibility.Visible; foreach (var update in lightUpdates) update(); };
+        row.MouseLeave += (_, _) => { foreach (var symbol in symbols) symbol.Visibility = Visibility.Hidden; foreach (var update in lightUpdates) update(); };
+        return row;
+    }
+
+    /// Drags the window from Prism's own title areas; a double-click zooms, like the Mac title bar.
+    internal void DragFrom(MouseButtonEventArgs args)
+    {
+        if (args.ChangedButton != MouseButton.Left) return;
+        if (args.ClickCount == 2) WindowState = WindowState == WindowState.Maximized ? WindowState.Normal : WindowState.Maximized;
+        else if (args.ButtonState == MouseButtonState.Pressed) { try { DragMove(); } catch (InvalidOperationException) { } }
+    }
+
+    /// A maximized custom-chrome window spills past the screen by its frame width; pad it back in.
+    void FitMaximized()
+    {
+        var frame = SystemParameters.WindowResizeBorderThickness;
+        ((FrameworkElement)Content).Margin = WindowState == WindowState.Maximized ? new Thickness(frame.Left + 4, frame.Top + 4, frame.Right + 4, frame.Bottom + 4) : new Thickness(0);
+    }
+
     [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
     static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);
 
@@ -325,6 +379,7 @@ public sealed partial class PrismWindow : Window
         _ = DwmSetWindowAttribute(handle, 35, ref caption, sizeof(int));
         _ = DwmSetWindowAttribute(handle, 36, ref text, sizeof(int));
         _ = DwmSetWindowAttribute(handle, 34, ref border, sizeof(int));
+        var round = 2; _ = DwmSetWindowAttribute(handle, 33, ref round, sizeof(int));
     }
 
     Task ChooseVideo()
@@ -390,6 +445,13 @@ public sealed partial class PrismWindow : Window
     {
         var line = new Border { Height = 1, Margin = margin }; line.SetResourceReference(Border.BackgroundProperty, "Line"); return line;
     }
+    /// The Mac's plus.square.fill: an ink tile with a Sky plus, for Create on the Sky fill.
+    internal static Border PlusTile(double size, double glyph)
+    {
+        var plus = Glyph("\uE710", glyph); plus.SetResourceReference(TextBlock.ForegroundProperty, "Action"); plus.FontWeight = FontWeights.Bold;
+        return new Border { Width = size, Height = size, CornerRadius = new CornerRadius(size / 5), Background = OnAction, Child = plus, VerticalAlignment = VerticalAlignment.Center };
+    }
+
     /// A Mac-style check: a ring, filled with a check when selected.
     internal static Grid CheckCircle(bool selected)
     {
@@ -428,7 +490,7 @@ public sealed partial class PrismWindow : Window
     }
     static Button NewButton(string title, bool primary, bool danger, string? icon = null)
     {
-        var button = new Button { Margin = new Thickness(0, 4, 8, 4), Padding = new Thickness(16, 0, 16, 0), MinHeight = 40, FontSize = 14, HorizontalAlignment = HorizontalAlignment.Left, HorizontalContentAlignment = HorizontalAlignment.Center };
+        var button = new Button { Margin = new Thickness(0, 4, 8, 4), Padding = new Thickness(16, 0, 16, 0), MinHeight = 40, FontSize = 14, HorizontalAlignment = HorizontalAlignment.Left };
         if (icon is null) button.Content = title;
         else { var mark = Glyph(icon, 12); mark.Margin = new Thickness(0, 0, 8, 0); button.Content = Row(mark, Label(title)); }
         if (primary) { button.SetResourceReference(Control.BackgroundProperty, "Action"); button.SetResourceReference(Control.BorderBrushProperty, "Action"); button.Foreground = OnAction; }

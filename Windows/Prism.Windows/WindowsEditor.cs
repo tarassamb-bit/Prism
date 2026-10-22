@@ -60,6 +60,7 @@ public sealed class WindowsEditor : IDisposable
         root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(session.Settings.TimelineHeight), MinHeight = 260 });
         root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         var header = new DockPanel { Margin = new Thickness(20, 0, 20, 0), Height = 54, LastChildFill = true };
+        var lights = ((PrismWindow)window).TrafficLights(); lights.Margin = new Thickness(0, 0, 18, 0); DockPanel.SetDock(lights, Dock.Left); header.Children.Add(lights);
         var home = Button("‹  Home", () => { player.Pause(); session.Screen = Screen.Home; }); Plain(home); home.ToolTip = "Back to projects"; DockPanel.SetDock(home, Dock.Left); header.Children.Add(home);
         var rule = new Border { Width = 1, Height = 20, Margin = new Thickness(10, 0, 16, 0) }; rule.SetResourceReference(Border.BackgroundProperty, "Line"); DockPanel.SetDock(rule, Dock.Left); header.Children.Add(rule);
         var mark = PrismWindow.Mark(20); mark.Margin = new Thickness(0, 0, 8, 0); DockPanel.SetDock(mark, Dock.Left); header.Children.Add(mark);
@@ -76,6 +77,7 @@ public sealed class WindowsEditor : IDisposable
         title.FontWeight = FontWeights.Medium; title.TextWrapping = TextWrapping.NoWrap; title.TextTrimming = TextTrimming.CharacterEllipsis; title.Margin = new Thickness(0, 0, 0, 2);
         var heading = new StackPanel { VerticalAlignment = VerticalAlignment.Center }; heading.Children.Add(title); heading.Children.Add(Text("Step 5 · Review and export", 11, true)); header.Children.Add(heading);
         var bar = new Border { Child = header, BorderThickness = new Thickness(0, 0, 0, 1) }; bar.SetResourceReference(Border.BackgroundProperty, "Surface1"); bar.SetResourceReference(Border.BorderBrushProperty, "Line");
+        bar.MouseLeftButtonDown += (_, args) => ((PrismWindow)window).DragFrom(args);
         Add(root, bar, 0);
 
         panes.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(session.Settings.LeftSidebarWidth), MinWidth = 200 });
@@ -83,6 +85,7 @@ public sealed class WindowsEditor : IDisposable
         panes.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star), MinWidth = 200 });
         panes.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(5) });
         panes.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(session.Settings.RightSidebarWidth), MinWidth = 248 });
+        leftTabs.SetResourceReference(FrameworkElement.StyleProperty, "ToolTabs");
         leftTabs.Items.Add(Tab(ToolHeader("", "Shorts"), Scroll(media))); leftTabs.Items.Add(Tab(ToolHeader("", "Captions"), Scroll(captions)));
         var autoSettings = Button("Auto Shorts settings", () => session.Screen = Screen.ImportSource); Plain(autoSettings);
         autoSettings.HorizontalAlignment = HorizontalAlignment.Stretch; autoSettings.Padding = new Thickness(14); autoSettings.FontSize = 11;
@@ -572,7 +575,7 @@ public sealed class WindowsEditor : IDisposable
     }
     static Button NewButton(string title, bool primary, bool danger = false)
     {
-        var button = new Button { Content = title, Margin = new Thickness(0, 3, 5, 3), Padding = new Thickness(10, 7, 10, 7), HorizontalContentAlignment = HorizontalAlignment.Center };
+        var button = new Button { Content = title, Margin = new Thickness(0, 3, 5, 3), Padding = new Thickness(10, 7, 10, 7) };
         if (primary) { button.SetResourceReference(Control.BackgroundProperty, "Action"); button.Foreground = Brushes.Black; }
         if (danger) button.SetResourceReference(Control.ForegroundProperty, "Coral"); return button;
     }
