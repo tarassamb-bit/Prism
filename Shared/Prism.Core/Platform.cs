@@ -15,6 +15,8 @@ public interface IKeyStore
 public interface IPlatform
 {
     IKeyStore KeyStore { get; }
+    /// <summary>Where the optional Prism account's sign-in is kept, protected the same way as the Gemini key.</summary>
+    IKeyStore AccountStore { get; }
     /// <summary>Moves a project folder to the Recycle Bin or Trash, where it can be restored. Throws when that fails.</summary>
     void MoveToTrash(string path);
     /// <summary>Shows the files selected in Explorer or the file manager.</summary>

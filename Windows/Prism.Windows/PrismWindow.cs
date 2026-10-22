@@ -156,7 +156,7 @@ public sealed partial class PrismWindow : Window
         {
             Screen.Home => $"home:{homeRevision}:{showAll}:{showUnfinished}:{openFolder}",
             Screen.Create or Screen.ImportSource => $"create:{createStep}:{session.ShortsSource?.Id}",
-            Screen.Settings => $"settings:{settingsCategory}", _ => "editor",
+            Screen.Settings => $"settings:{settingsCategory}:{session.Account.IsSignedIn}", _ => "editor",
         };
         if (renderedScreen != key)
         {

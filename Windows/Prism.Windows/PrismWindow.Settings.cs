@@ -16,9 +16,10 @@ public sealed partial class PrismWindow
         page.Margin = new Thickness(32); page.MaxWidth = 1064; page.HorizontalAlignment = HorizontalAlignment.Left;
         var tiles = Row(
             CategoryTile(0, "", "AI & Cloud", "Provider, key, and model"),
+            CategoryTile(2, "\uE77B", "Account", session.Account.Email ?? "Sign in to track your stats"),
             CategoryTile(1, "", "System resources", "RAM and storage updates"));
         tiles.Margin = new Thickness(0, 16, 0, 20); page.Children.Add(tiles);
-        page.Children.Add(settingsCategory == 0 ? AiSettings() : ResourceSettings());
+        page.Children.Add(settingsCategory switch { 0 => AiSettings(), 2 => AccountSettings(), _ => ResourceSettings() });
         return Scroll(page);
     }
 
@@ -122,6 +123,45 @@ public sealed partial class PrismWindow
             remove.IsEnabled = !session.IsTestingGemini && !session.IsEditingGeminiKey;
             section.IsEnabled = !session.IsBusy;
         };
+        return section;
+    }
+
+    /// The optional Prism account, as on the Mac: sign in, and each export adds to your stats on the website.
+    UIElement AccountSettings()
+    {
+        var section = Column(SectionTitle("\uE77B", "Account"),
+            Text("Optional. When you're signed in, each export adds its date, number of Shorts, length and quality to your stats on the Prism website. Videos, transcripts and file names stay on your PC.", muted: true),
+            Divider(new Thickness(0, 14, 0, 14)));
+        var account = session.Account;
+        if (account.Email is { } email)
+        {
+            var check = Glyph("\uE930", 16, "Accent"); check.Margin = new Thickness(0, 0, 10, 0);
+            var who = Text($"Signed in as {email}", 13); who.FontWeight = FontWeights.Medium; who.Margin = new Thickness(0);
+            var signOut = Button("Sign out", account.SignOut, danger: true); signOut.Margin = new Thickness(0);
+            var row = new DockPanel(); DockPanel.SetDock(signOut, Dock.Right); row.Children.Add(signOut); row.Children.Add(Row(check, who));
+            section.Children.Add(Surface(row, 12, 12));
+            var stats = Link(Button("See your stats in the browser", () => WindowsPlatform.OpenExternal(Account.StatsPage)));
+            stats.SetResourceReference(ForegroundProperty, "Accent"); stats.Margin = new Thickness(-8, 8, 0, 0); section.Children.Add(stats);
+        }
+        else
+        {
+            var address = Entry("", "Email"); address.Margin = new Thickness(0, 0, 0, 8);
+            var password = new PasswordBox { Padding = new Thickness(10), Margin = new Thickness(0, 0, 0, 8) };
+            AutomationProperties.SetName(password, "Password (at least 6 characters)");
+            var hint = Text("Password (at least 6 characters)", 12, muted: true); hint.Margin = new Thickness(0, 0, 0, 4);
+            var signIn = Button("Sign in", async () => { await account.SignIn(address.Text, password.Password); if (account.IsSignedIn) password.Clear(); }, true);
+            var create = Button("Create account", async () => { await account.SignUp(address.Text, password.Password); password.Clear(); });
+            void Enable() => signIn.IsEnabled = create.IsEnabled = !account.IsWorking && address.Text.Trim().Length > 0 && password.Password.Length > 0;
+            address.TextChanged += (_, _) => Enable(); password.PasswordChanged += (_, _) => Enable();
+            password.KeyDown += async (_, args) => { if (args.Key == Key.Enter && signIn.IsEnabled) { args.Handled = true; await account.SignIn(address.Text, password.Password); if (account.IsSignedIn) password.Clear(); } };
+            section.Children.Add(address); section.Children.Add(hint); section.Children.Add(password); section.Children.Add(Row(signIn, create));
+            Enable();
+            updateScreen = Enable;
+        }
+        var status = Text(account.Status, 12, muted: true);
+        section.Children.Add(status);
+        var inner = updateScreen;
+        updateScreen = () => { inner?.Invoke(); status.Text = account.Status; status.Visibility = account.Status.Length > 0 ? Visibility.Visible : Visibility.Collapsed; };
         return section;
     }
 
