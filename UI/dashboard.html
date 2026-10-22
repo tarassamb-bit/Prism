@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0E0F14" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#F6F3EC" media="(prefers-color-scheme: light)">
+  <title>Dashboard — Prism</title>
+  <meta name="description" content="Your Prism plan, billing and export history.">
+  <link rel="canonical" href="https://prismclips.app/dashboard">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Prism">
+  <meta property="og:title" content="Dashboard — Prism">
+  <meta property="og:description" content="Your Prism plan, billing and export history.">
+  <meta property="og:url" content="https://prismclips.app/dashboard">
+  <meta property="og:image" content="https://prismclips.app/og-image.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="Prism — Long video. Short-form magic.">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="icon" href="/favicon.ico" sizes="32x32">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="manifest" href="/site.webmanifest">
+  <meta name="robots" content="noindex">
+  <link rel="preload" href="fonts/SpaceGrotesk-Medium.ttf" as="font" type="font/ttf" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+  <script src="vendor/supabase-2.45.4.js" defer></script>
+  <script src="supabase-client.js" defer></script>
+  <script src="account.js" defer></script>
+  <script src="https://cdn.paddle.com/paddle/v2/paddle.js" defer></script>
+  <script src="pricing-tiers.js" defer></script>
+  <script src="pricing.js" defer></script>
+  <script src="billing.js" defer></script>
+  <script src="dashboard.js" defer></script>
+</head>
+<body data-auth-page="dashboard" class="page-dashboard">
+  <a class="skip-link" href="#main">Skip to content</a>
+  <svg class="icon-library" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><defs>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-6-6 6 6-6 6"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M5 16v4h14v-4"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="m9 5 11 7-11 7Z"/></symbol>
+    <symbol id="i-spark" viewBox="0 0 24 24"><path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5ZM20 2v4m-2-2h4"/></symbol>
+    <symbol id="i-frame" viewBox="0 0 24 24"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5M9 8h6v8H9Z"/></symbol>
+    <symbol id="i-captions" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="M10 10H7v4h3m7-4h-3v4h3"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="i-github" viewBox="0 0 24 24"><path d="M9 19c-4 1-4-2-6-2m15 5v-3.9c0-1-.3-1.8-.8-2.3 2.7-.3 5.5-1.3 5.5-6A4.7 4.7 0 0 0 21.4 6a4.4 4.4 0 0 0-.1-3.7S20.3 2 17.4 3.8a13.2 13.2 0 0 0-7 0C7.5 2 6.5 2.3 6.5 2.3A4.4 4.4 0 0 0 6.4 6a4.7 4.7 0 0 0-1.3 3.3c0 4.7 2.8 5.7 5.5 6-.5.5-.8 1.3-.8 2.3V22" transform="translate(-1 -1) scale(.95)"/></symbol>
+    <symbol id="i-apple" viewBox="0 0 24 24"><path d="M16.6 12.5c0-2 1.7-3 1.8-3.1-1-1.5-2.6-1.7-3.2-1.7-1.4-.2-2.7.8-3.4.8s-1.8-.8-2.9-.8C7.4 7.7 6 8.6 5.2 10c-1.6 2.8-.4 7 1.2 9.3.8 1.1 1.6 2.3 2.8 2.2 1.1 0 1.6-.7 3-.7s1.8.7 3 .7 2-1.1 2.7-2.2c.9-1.3 1.3-2.5 1.3-2.5s-2.6-1-2.6-4.3ZM14.3 6.1c.6-.8 1.1-1.9 1-3.1-1 .1-2.1.7-2.8 1.5-.6.7-1.2 1.9-1.1 3 1.1.1 2.2-.6 2.9-1.4Z"/></symbol>
+    <symbol id="i-windows" viewBox="0 0 24 24"><path d="m3 5 8-1v7H3Zm10-1 8-1v8h-8ZM3 13h8v7l-8-1Zm10 0h8v8l-8-1Z"/></symbol>
+    <symbol id="i-linux" viewBox="0 0 24 24"><path d="M8 11V7a4 4 0 0 1 8 0v4l3 7-4 3-3-2-3 2-4-3Z"/><path d="m10 11 2 1 2-1M10 7v1m4-1v1"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14M12 5v14"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 5v2"/></symbol>
+  </defs></svg>
+  <div class="app" id="account">
+    <aside class="app-sidebar">
+      <a class="brand" href="index.html" aria-label="Prism home"><img src="icon.png" width="28" height="28" alt=""><span>Prism<span class="brand-dot">.</span></span></a>
+      <nav class="app-nav" aria-label="Dashboard">
+        <a href="#overview" data-tab="overview">Overview</a>
+        <a href="#plans" data-tab="plans">Plans &amp; billing</a>
+        <a href="#history" data-tab="history">Exports</a>
+        <a href="#settings" data-tab="settings">Settings</a>
+      </nav>
+      <div class="app-user"><span id="who"></span><button class="button button-secondary button-small" id="signOut" type="button">Sign out</button></div>
+    </aside>
+    <main id="main" class="app-main">
+      <p id="status" role="status" aria-live="polite" aria-atomic="true"></p>
+      <div id="signedIn" hidden>
+        <section class="app-panel" id="overview" data-panel>
+          <p class="eyebrow">YOUR PRISM SPACE</p><h1>Overview</h1>
+          <div class="info-card highlight app-plan"><span class="card-eyebrow">YOUR PLAN</span><p id="plan">Loading your plan…</p><button class="button button-secondary" id="manage-billing" type="button" hidden>Manage billing</button></div>
+          <div class="stats"><div class="stat"><b id="export-count">—</b><span>Exports</span></div><div class="stat"><b id="shorts">—</b><span>Shorts made</span></div><div class="stat"><b id="minutes">—</b><span>Minutes of Shorts</span></div></div>
+        </section>
+        <section class="app-panel" id="plans" data-panel hidden>
+          <p class="eyebrow">MONTHLY PLANS</p><h2>Plans &amp; billing</h2>
+          <p id="plans-note">Prices are in your local currency, with tax where it applies.</p>
+          <p id="pricing-status" role="status" aria-live="polite"></p><div class="card-grid" id="tiers"></div>
+        </section>
+        <section class="app-panel" id="history" data-panel hidden>
+          <p class="eyebrow">YOUR CREATIVE MOMENTUM</p><h2>Exports</h2>
+          <div class="table-wrap"><table><caption class="sr-only">Your most recent 50 exports from Prism</caption><thead><tr><th scope="col">Date</th><th scope="col">Shorts</th><th scope="col">Length</th><th scope="col">Quality</th></tr></thead><tbody id="rows"></tbody></table></div>
+        </section>
+        <section class="app-panel" id="settings" data-panel hidden>
+          <p class="eyebrow">YOUR ACCOUNT</p><h2>Settings</h2>
+          <div class="info-card"><span class="card-eyebrow">SIGNED IN AS</span><p id="settings-email"></p><p>Sign in to the Prism app with this same account.</p><a class="button button-primary" href="download.html">Download Prism <svg class="icon" aria-hidden="true"><use href="#i-download"/></svg></a></div>
+        </section>
+      </div>
+      <!-- account.js needs its sign-in form; signed-out visitors are sent to /login. -->
+      <div id="auth-form-wrap" hidden><form id="auth"><input name="email" type="email"><input name="password" type="password"></form></div>
+    </main>
+  </div>
+</body>
+</html>

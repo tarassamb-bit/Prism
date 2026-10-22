@@ -17,19 +17,21 @@ struct GeminiConfiguration: Sendable {
     }
 }
 
+/// One secret in the Keychain. The Gemini key and the Prism account's sign-in both use it.
 enum GeminiKeyStore {
-    private static var query: [String: Any] {
-        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "Relio.Gemini", kSecAttrAccount as String: "api-key"]
+    private static func query(_ service: String) -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: "api-key"]
     }
-    static func read() -> String {
-        var q = query
+    static func read(service: String = "Relio.Gemini") -> String {
+        var q = query(service)
         q[kSecReturnData as String] = true
         q[kSecMatchLimit as String] = kSecMatchLimitOne
         var item: CFTypeRef?
         guard SecItemCopyMatching(q as CFDictionary, &item) == errSecSuccess, let data = item as? Data else { return "" }
         return String(decoding: data, as: UTF8.self)
     }
-    static func save(_ key: String) throws {
+    static func save(_ key: String, service: String = "Relio.Gemini") throws {
+        let query = query(service)
         let data = Data(key.trimmingCharacters(in: .whitespacesAndNewlines).utf8)
         if data.isEmpty {
             let status = SecItemDelete(query as CFDictionary)
@@ -44,7 +46,7 @@ enum GeminiKeyStore {
             guard SecItemAdd(q as CFDictionary, nil) == errSecSuccess else { throw Failure.save }
         } else if status != errSecSuccess { throw Failure.save }
     }
-    enum Failure: LocalizedError { case save; var errorDescription: String? { "Could not save the Gemini key in Keychain." } }
+    enum Failure: LocalizedError { case save; var errorDescription: String? { "Could not save to Keychain." } }
 }
 
 enum GeminiSelection {
@@ -386,9 +388,10 @@ enum GeminiSelection {
         generator.maximumSize = CGSize(width: 640, height: 360)
         let frameWindows = allowedWindows.isEmpty ? [interval] : allowedWindows
         let perWindow = max(1, 12 / frameWindows.count)
-        let times = frameWindows.flatMap { window in (0..<perWindow).map {
-            window.start + (window.end - window.start) * (Double($0) + 0.5) / Double(perWindow)
-        } }
+        let times: [Double] = frameWindows.flatMap { window -> [Double] in
+            let step = (window.end - window.start) / Double(perWindow)
+            return (0..<perWindow).map { window.start + step * (Double($0) + 0.5) }
+        }
         for time in times {
             try Task.checkCancellation()
             guard let frame = try? generator.copyCGImage(at: CMTime(seconds: time, preferredTimescale: 600), actualTime: nil),

@@ -1,0 +1,378 @@
+# Prism — full text of prismclips.app
+
+> Every main page of prismclips.app as plain text. Summary and links: https://prismclips.app/llms.txt
+
+Plans (rendered by script on /pricing): Trial $9/month, Creator $39/month (7-day free trial), Studio $149/month (7-day free trial). Billed monthly in local currency; AI processing included; cancel anytime.
+
+---
+
+URL: https://prismclips.app/
+Title: Prism — Long video. Short-form magic.
+
+A fresh perspective on short-form BETA
+
+# Long video. Short-form magic.
+
+Your next great Short is already in your video. Prism finds the moments, frames the story, and adds the captions. You make the final cut.
+
+Get Prism See how it works
+
+Mac, Windows & Linux · 7-day free trial on Creator and Studio
+
+THE GOOD PART STARTS HERE 01 / PRISM EDITOR
+
+YOUR NEXT CREATIVE SHORTCUTONE IN. MANY OUT.
+
+Real app. Illustrated demo footage.1080 × 1920 / MP4 / Made to share
+
+AI finds it. You make it yours.9:16 · MP4
+
+01 / THE TOOLKIT
+### A little AI. A lot of control.
+
+Explore clip selection, framing, and captions.
+
+02 / THE PRICE
+### Simple monthly plans.
+
+Plans from $9 a month. AI processing included. Cancel anytime.
+
+03 / THE DETAILS
+### A few good questions.
+
+Get answers before you make your first Short.
+
+---
+
+URL: https://prismclips.app/features
+Title: Features — Prism
+
+THE CREATIVE TOOLKIT
+
+# A little AI. A lot of you.
+Find the moments worth sharing. Make every frame and every word feel like yours.
+
+Find your moments01
+Frame the story02
+Make every word count03
+
+THE STORY COMES FIRST
+#### More than a clip. A complete thought.
+Prism looks for a hook, the context, and a payoff. Cuts land on whole sentences, so your best ideas get the room they need.
+
+- Moments from across your selected range
+
+- Review and refine every suggested Short
+Find your next Short
+Your footage. Your brief. Your call.
+
+### Your taste. The final cut.
+See the workflow
+
+#### Review every Short
+Fine-tune clip timing and framing in a native desktop editor before exporting.
+
+#### Ask for an edit
+Use editor chat to request changes in plain language, from trimming to muting the audio.
+
+#### Keep your originals
+Source files are copied, never modified. New batches append, and each batch can be undone.
+
+#### Ready to share
+Export vertical MP4s at up to 1080 × 1920, then upload them to your favorite platforms.
+
+ONE IN. MANY OUT.
+
+### Give your footage a new perspective.
+
+Get Prism
+
+---
+
+URL: https://prismclips.app/how-it-works
+Title: How it works — Prism
+
+FROM THE FULL STORY TO THE GOOD PART
+
+# Less busywork. More “that’s the one.”
+From a long recording to a Short worth sharing.
+Three steps. Your creative control all the way.
+
+01BRING THE STORY
+.MOV
+The long takeOne video. Plenty of potential.
++
+
+#### Drop in your video.
+A podcast, a lecture, your latest stream. Choose your source and tell Prism what you’re looking for.
+
+02FIND THE GOOD PART
+
+00:00 THE MOMENTS THAT MATTER 42:18
+
+#### Let the moments find you.
+Gemini finds standalone stories, then Prism cuts, reframes, and captions them for the small screen.
+
+03MAKE IT YOURS
+Ready for the spotlight.1080 × 1920 · MP4
+
+#### Your taste. The final cut.
+Fine-tune the timing, framing, and captions. Export your favorites as vertical MP4s, ready to share.
+
+### Before your first Short
+You’ll need a video, an internet connection and a Prism plan. Your source files and rendered videos stay on your computer; audio, transcripts, and sampled frames go to Gemini for processing. See how your data is used
+
+YOUR NEXT CREATIVE SHORTCUT
+
+### One download. Plenty of potential.
+
+Choose your platform
+
+---
+
+URL: https://prismclips.app/pricing
+Title: Pricing — Prism
+
+MONTHLY PLANS
+
+# Pick your plan.
+Prices are shown in your local currency, with tax where it applies. Creator and Studio start with a 7-day free trial.
+
+ABOUT PLANS
+
+### Good to know.
+
+**Is there a free trial?**
+Creator and Studio start with a 7-day free trial. You add a payment method at checkout and aren’t charged until the trial ends; cancel before then and you pay nothing. The Trial plan is $9 a month from the start.
+
+**How do I cancel?**
+Anytime, in a few clicks: open your dashboard, choose Manage billing and cancel your plan. It stays active until the end of the period you’ve paid for.
+
+**Which platforms does Prism run on?**
+Windows 10 and 11 (64-bit), macOS 14 or later on Apple Silicon, and Linux (x86_64 with GTK 4).
+
+**Which languages do captions support?**
+Prism transcribes speech and writes captions in the language spoken in your video. Automatic filler-word cleanup currently works for English only.
+
+---
+
+URL: https://prismclips.app/download
+Title: Download — Prism
+
+YOUR NEXT CREATIVE SHORTCUT
+
+# Meet your next favorite tool.
+Choose your platform. Find the good part.
+v0.2.0-beta.2 · Early test build
+
+RECOMMENDED
+
+#### Made for Mac.
+macOS 14+ · Apple Silicon
+Download for Mac .dmg · Native macOS app
+**Installation notes **
+Open the DMG and drag Prism to Applications. This beta is not notarized. For first-launch help, see the release notes.
+
+UNTESTED
+
+#### Windows, too.
+Windows 10 or 11 · 64-bit
+Download for Windows .exe · ffmpeg included
+**Installation notes **
+Run the setup file to install Prism. Desktop playback and platform services still need testing on Windows. Check the release notes before installing.
+
+UNTESTED
+
+#### Hello, Linux.
+x86_64 · GTK 4 required
+Download for Linux .AppImage · ffmpeg included
+**Installation notes **
+In your file manager, allow the AppImage to run as a program, then open it. Desktop playback and platform services still need testing on Linux. Read the release notes.
+
+AI processing is included in your plan. An internet connection is required.
+Verify your download
+
+A LITTLE HELP GETTING STARTED?
+
+### We’ve got the details.
+
+Read the FAQs
+
+---
+
+URL: https://prismclips.app/faq
+Title: Help & FAQs — Prism
+
+A FEW GOOD QUESTIONS
+
+# A little clarity. Then, create.
+Everything to know before your first Short.
+
+**How much does Prism cost?**
+There are three monthly plans: Trial ($9), Creator ($39) and Studio ($149), shown in your local currency. Creator and Studio start with a 7-day free trial, AI processing is included, and you can cancel anytime. See the plans.
+
+**What happens to my footage?**
+Your source files, projects, preview, and rendering stay on your computer. Audio chunks, transcripts, sampled frames, and editor chat messages are sent to Google for AI processing. Prism needs an internet connection; it has no offline AI mode.
+
+**Can I change the Shorts Prism picks?**
+Yes. Review and adjust every Short before export. Change the timing, choose Fill, Fit, or Split framing, try seven caption styles, or ask the editor chat to help with edits.
+
+**Where can I post my exports?**
+Prism exports vertical MP4 files at up to 1080 × 1920. Upload them yourself to your favorite short-form platforms, including YouTube Shorts, Instagram Reels, and TikTok. Direct publishing isn’t built in.
+
+**Is this ready for my daily workflow?**
+Prism is an early beta. The Mac pipeline works end to end, but you should review every clip and expect rough edges. Windows and Linux ports are available but still need verification on real devices. Read the current limits.
+
+**Do I need a Prism account?**
+Yes. Your plan belongs to your Prism account, so you need one to subscribe. Sign in to the app with the same account. Your dashboard also shows your export stats and history. Create an account.
+
+**How do I get started?**
+Download Prism for your platform, sign in with your Prism account, and import a video. See the three-step workflow for a quick tour.
+
+### Something else on your mind?
+Check the project documentation ↗ or share your feedback on GitHub ↗.
+
+---
+
+URL: https://prismclips.app/about
+Title: About — Prism
+
+ABOUT PRISM
+
+# One video in. Many Shorts out.
+Prism is a desktop app that turns long videos into vertical Shorts with captions.
+
+### What Prism does
+Import a podcast, lecture, interview or stream. Prism transcribes it, finds moments that stand on their own, and cuts them into vertical Shorts. It reframes each one for the small screen and adds captions in the language spoken in your video. You review every Short and make the final cut before you export.
+
+### Who it’s for
+Creators, podcasters and streamers who want more short-form videos from the long recordings they already make, without spending hours in an editor.
+
+### Where it runs
+Prism runs on your computer: Windows 10 and 11 (64-bit), macOS 14 or later on Apple Silicon, and Linux (x86_64 with GTK 4). Your source files and finished videos stay on your machine. See Privacy for what is sent for AI processing.
+
+### Plans
+Three monthly plans: Trial ($9), Creator ($39) and Studio ($149), shown in your local currency. Creator and Studio start with a 7-day free trial. AI processing is included, and you can cancel anytime. Compare plans.
+
+### Learn more
+See features, how it works and the FAQs, or download Prism.
+
+---
+
+URL: https://prismclips.app/changelog
+Title: Changelog — Prism
+
+RELEASE NOTES
+
+# Changelog
+What changed in each Prism build. Downloads live on GitHub Releases.
+
+### Unreleased
+NEXT
+
+#### New
+
+- Optional Prism account. Sign in on the website to see your exports, Shorts made and minutes of Shorts.
+
+### v0.2.0-beta.2
+2026-10-21 · BETA
+
+#### New
+
+- Installers for macOS (.dmg), Windows (.exe) and Linux (.AppImage), built on every release tag.
+
+- Native Windows and Linux workspaces on a shared engine. Both are untested on real devices.
+
+#### Fixed
+
+- Gemini timeouts now fail the run instead of silently dropping results.
+
+- Crops stay inside frames with odd pixel sizes.
+
+- macOS release builds with the newest Xcode and its own SQLite.
+
+### Earlier builds
+2026-10-18 – 10-20
+
+- First Prism video-to-Shorts editor for Mac.
+
+- Gemini became the only AI pipeline for picking Shorts and framing.
+
+- Better Shorts selection, caption customization and editing.
+
+- Shared rendering engine with tests.
+
+---
+
+URL: https://prismclips.app/privacy
+Title: Privacy — Prism
+
+PRIVACY
+
+# Your footage stays yours.
+Plain-language summary of where your data goes. Last updated 2026-10-22.
+
+### On your computer
+
+- Your source video files. Prism copies them into a project and never changes the originals.
+
+- Projects, previews and rendered MP4s.
+
+- Your Gemini API key. On Mac it is stored in the Keychain, never in projects or preferences.
+
+### Sent to Google
+Prism has no offline mode. Every AI step runs on Google’s Gemini API, so Google’s terms and privacy policy apply to this data:
+
+- Audio chunks of the part of the video you selected.
+
+- Transcripts.
+
+- Sampled frames: up to 12 per refinement batch, and about 1 per second of each tracked Short.
+
+- Editor chat messages, with recent conversation and a short edit summary.
+Temporary audio files are deleted after each request. See Google’s Privacy Policy and the Gemini API terms.
+
+### Your Prism account
+Your Prism account is stored with our database provider, Supabase. Payments are handled by Paddle, our reseller; Prism never sees your card details. The account stores:
+
+- Your email address and password. The password is stored hashed by Supabase Auth.
+
+- Your plan’s Paddle subscription and customer IDs, status and next billing date.
+
+- One record per finished export from the Mac app: the date, number of Shorts, total length in seconds and export quality.
+No video, audio, transcripts or titles are sent to your account. Database rules let each user read only their own records. Deleting your account deletes its export records.
+
+### Questions or deletion requests
+Open an issue on GitHub to ask a question or to have your account deleted.
+
+This page describes how the software works. It is not legal advice.
+
+---
+
+URL: https://prismclips.app/terms
+Title: Terms — Prism
+
+TERMS
+
+# Terms of use
+The short version: Prism is beta software, provided as is. Last updated 2026-10-22.
+
+### The software
+Prism is provided “as is”, without warranty of any kind.
+
+### Beta status
+Prism is early beta software. Review every Short before you publish it, and keep your own backups. The Windows and Linux versions have not been tested on real devices yet.
+
+### Your content
+You keep all rights to your videos and exports. You are responsible for having the rights to the footage you process and the Shorts you publish.
+
+### Gemini
+Prism sends audio, transcripts and sampled frames to Google’s Gemini API for AI processing. That processing is covered by Google’s Gemini API terms.
+
+### Your account
+Keep your password safe and don’t use the account to break the service or access other people’s data. Accounts may be removed if they are abused. See the Privacy page for what the account stores.
+
+### Changes
+These terms may change as Prism grows. The date at the top shows the latest version.
+
+This is a plain-language draft, not legal advice.

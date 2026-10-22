@@ -1,0 +1,3 @@
+# Secret keys for local testing; never commit.
+.env.local
+.DS_Store

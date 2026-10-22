@@ -75,6 +75,7 @@ final class AppModel {
     var isExporting = false
     /// Set when an export finishes; shown as a popup with a Finder shortcut.
     var exportSummary: String?
+    let account = Account()
     func cancelGeneration() {
         guard generationTask != nil else { return }
         generationStage = "Cancelling…"
@@ -888,6 +889,8 @@ final class AppModel {
                 if !sources.isEmpty { parts.append("the main video") }
                 message = withModelNote("Exported \(parts.joined(separator: " and ")) to \(Self.displayPath(folder)).")
                 exportSummary = message
+                let seconds = segments.reduce(0) { $0 + $1.element.duration }
+                Task { await account.recordExport(shortCount: segments.count, seconds: seconds, quality: choice.quality.rawValue) }
             }
             catch {
                 let completed = exportedFiles.count
@@ -1642,7 +1645,9 @@ struct ContentView: View {
         .init(title: "30 minutes", seconds: 1_800), .init(title: "45 minutes", seconds: 2_700),
         .init(title: "60 minutes", seconds: 3_600)
     ]
-    private enum SettingsCategory { case aiCloud, systemResources }
+    private enum SettingsCategory { case aiCloud, account, systemResources }
+    @State private var accountEmail = ""
+    @State private var accountPassword = ""
     var body: some View {
         HStack(spacing: 0) {
             if model.screen != .editor { sidebar.frame(width: sidebarCollapsed ? 76 : 252) }
@@ -1842,6 +1847,38 @@ struct ContentView: View {
             AppearanceSwitch(selection: $appearance).padding(.leading, 12)
         }.padding(20)
     }
+    var accountSettings: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Label("Account", systemImage: "person.crop.circle").font(Prism.display(20))
+            Text("Optional. When you're signed in, each export adds its date, number of Shorts, length and quality to your stats on the Prism website. Videos, transcripts and file names stay on your Mac.")
+                .font(Prism.text(13)).foregroundStyle(Prism.textSecondary).fixedSize(horizontal: false, vertical: true)
+            Divider()
+            if let email = model.account.email {
+                HStack(spacing: 10) {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(Prism.accent)
+                    Text("Signed in as \(email)").font(Prism.text(13, .medium))
+                    Spacer()
+                    Button("Sign out", role: .destructive) { model.account.signOut() }
+                }
+                .padding(12)
+                .background(Prism.surface1, in: RoundedRectangle(cornerRadius: 12))
+                Link("See your stats in the browser", destination: Account.statsPage)
+            } else {
+                TextField("Email", text: $accountEmail).textFieldStyle(.roundedBorder).textContentType(.username)
+                SecureField("Password (at least 6 characters)", text: $accountPassword).textFieldStyle(.roundedBorder).textContentType(.password)
+                HStack {
+                    Button("Sign in") { Task { await model.account.signIn(email: accountEmail, password: accountPassword); if model.account.isSignedIn { accountPassword = "" } } }
+                        .buttonStyle(.prismPrimary)
+                    Button("Create account") { Task { await model.account.signUp(email: accountEmail, password: accountPassword); accountPassword = "" } }
+                }
+                .disabled(model.account.isWorking || accountEmail.isEmpty || accountPassword.isEmpty)
+            }
+            if !model.account.status.isEmpty {
+                Text(model.account.status).font(Prism.text(12)).foregroundStyle(Prism.textSecondary)
+            }
+        }
+    }
+
     var settingsPage: some View {
         VStack(alignment: .leading, spacing: 20) {
             VStack(alignment: .leading, spacing: 6) {
@@ -1852,6 +1889,9 @@ struct ContentView: View {
             HStack(spacing: 14) {
                 SettingsCategoryTile(title: "AI & Cloud", detail: "Provider, key, and model", icon: "sparkles", isSelected: selectedSettingsCategory == .aiCloud) {
                     withAnimation(.easeInOut(duration: 0.2)) { selectedSettingsCategory = .aiCloud }
+                }
+                SettingsCategoryTile(title: "Account", detail: model.account.email ?? "Sign in to track your stats", icon: "person.crop.circle", isSelected: selectedSettingsCategory == .account) {
+                    withAnimation(.easeInOut(duration: 0.2)) { selectedSettingsCategory = .account }
                 }
                 SettingsCategoryTile(title: "System resources", detail: "RAM and storage updates", icon: "chart.bar.xaxis", isSelected: selectedSettingsCategory == .systemResources) {
                     withAnimation(.easeInOut(duration: 0.2)) { selectedSettingsCategory = .systemResources }
@@ -1966,6 +2006,8 @@ struct ContentView: View {
                             .font(Prism.text(12)).foregroundStyle(Prism.textSecondary).fixedSize(horizontal: false, vertical: true)
                         }
                         .disabled(model.isBusy)
+                    } else if selectedSettingsCategory == .account {
+                        accountSettings
                     } else {
                         TimelineView(.periodic(from: .now, by: min(3_600, max(1, resourceRefreshSeconds)))) { _ in
                             let machine = MachineProfile.detect()

@@ -1,0 +1,9 @@
+{
+  "cleanUrls": true,
+  "redirects": [
+    { "source": "/account", "destination": "/login", "permanent": true }
+  ],
+  "rewrites": [
+    { "source": "/dashboard_(.+)", "destination": "/dashboard" }
+  ]
+}
